@@ -1,0 +1,12 @@
+[Unit]
+Description=HSync Client Service
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/hsync client
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

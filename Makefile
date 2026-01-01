@@ -1,7 +1,7 @@
 BINARY_NAME=hsync
 BUILD_DIR=bin
 
-.PHONY: all build clean test
+.PHONY: all build clean test install-service
 
 all: build
 
@@ -14,3 +14,6 @@ clean:
 
 test: build
 	./scripts/test.sh
+
+install-service:
+	./scripts/install_service.sh
