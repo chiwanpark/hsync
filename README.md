@@ -10,35 +10,37 @@ It consists of a central server and client software that communicate via HTTP to
 - **HTTP Transport:** communicating over standard HTTP.
 - **Shared Key Authentication:** simple security model using a shared secret key between server and clients.
 - **Automatic Sync:** Clients automatically detect local changes and push them to the server.
+- **Single Binary:** Both server and client functionalities are bundled into a single `hsync` executable.
 
 ## Installation
 
 ### Prerequisites
 
-- [Go](https://go.dev/) 1.18 or higher.
+- [Go](https://go.dev/) 1.25.3 or higher.
 
 ### Build
 
-Clone the repository and build the server and client binaries:
+Clone the repository and build the `hsync` binary:
 
 ```bash
 git clone <repository-url>
 cd hsync
 go mod tidy
-go build -o bin/server ./cmd/server
-go build -o bin/client ./cmd/client
+go build -o bin/hsync ./cmd/hsync
 ```
 
-The binaries will be located in the `bin/` directory.
+The binary will be located in the `bin/` directory.
 
 ## Usage
+
+The `hsync` binary uses subcommands to run as either a server or a client.
 
 ### Server
 
 The server manages the central copy of the notes and handles merge operations.
 
 ```bash
-./bin/server [flags]
+./bin/hsync server [flags]
 ```
 
 **Flags:**
@@ -48,7 +50,7 @@ The server manages the central copy of the notes and handles merge operations.
 
 **Example:**
 ```bash
-./bin/server -addr :8080 -dir ./server_notes -key mySecretKey
+./bin/hsync server -addr :8080 -dir ./server_notes -key mySecretKey
 ```
 
 ### Client
@@ -56,18 +58,18 @@ The server manages the central copy of the notes and handles merge operations.
 The client runs on your local machine, monitoring a directory and syncing changes to the server.
 
 ```bash
-./bin/client [flags]
+./bin/hsync client [flags]
 ```
 
 **Flags:**
 - `-server`: URL of the hsync server (default `"http://localhost:8080"`).
-- `-dir`: Path to the local directory to synchronize (default `"."`).
+- `-dir`: Path to the local directory to synchronize (default: platform-specific Heynote notes path).
 - `-key`: Shared secret key matching the server (default `"default-secret"`).
 - `-interval`: Duration to wait between checks (default `5s`).
 
 **Example:**
 ```bash
-./bin/client -server http://myserver.com:8080 -dir ./my_notes -key mySecretKey -interval 2s
+./bin/hsync client -server http://myserver.com:8080 -dir ./my_notes -key mySecretKey -interval 2s
 ```
 
 ## How it Works
@@ -85,6 +87,5 @@ The client runs on your local machine, monitoring a directory and syncing change
 You can run the provided test script to simulate a sync session with one server and two clients:
 
 ```bash
-bash test.sh
+./scripts/test.sh
 ```
-

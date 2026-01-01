@@ -1,4 +1,4 @@
-package main
+package server
 
 import (
 	"encoding/json"
@@ -14,40 +14,53 @@ import (
 	"sync"
 )
 
-var (
-	addr   = flag.String("addr", ":8080", "Address to listen on")
-	key    = flag.String("key", "default-secret", "Shared key for authentication")
-	dataDir = flag.String("dir", "data", "Path to the server-side data directory")
-)
+type Server struct {
+	Addr    string
+	Key     string
+	DataDir string
+	mu      sync.Mutex
+}
 
-var dirMutex sync.Mutex
+func Run(args []string) {
+	fs := flag.NewFlagSet("server", flag.ExitOnError)
+	s := &Server{}
+	fs.StringVar(&s.Addr, "addr", ":8080", "Address to listen on")
+	fs.StringVar(&s.Key, "key", "default-secret", "Shared key for authentication")
+	fs.StringVar(&s.DataDir, "dir", "data", "Path to the server-side data directory")
 
-func main() {
-	flag.Parse()
-
-	// Ensure data directory exists
-	if err := os.MkdirAll(*dataDir, 0755); err != nil {
+	if err := fs.Parse(args); err != nil {
 		log.Fatal(err)
 	}
 
-	http.HandleFunc("/sync", handleSync)
+	// Ensure data directory exists
+	if err := os.MkdirAll(s.DataDir, 0755); err != nil {
+		log.Fatal(err)
+	}
 
-	log.Printf("Server listening on %s", *addr)
-	log.Printf("Data directory: %s", *dataDir)
-	if err := http.ListenAndServe(*addr, nil); err != nil {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/sync", s.handleSync)
+
+	srv := &http.Server{
+		Addr:    s.Addr,
+		Handler: mux,
+	}
+
+	log.Printf("Server listening on %s", s.Addr)
+	log.Printf("Data directory: %s", s.DataDir)
+	if err := srv.ListenAndServe(); err != nil {
 		log.Fatal(err)
 	}
 }
 
-func handleSync(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 	// Apply Auth
-	if r.Header.Get("X-Sync-Key") != *key {
+	if r.Header.Get("X-Sync-Key") != s.Key {
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
 
-	dirMutex.Lock()
-	defer dirMutex.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	if r.Method == http.MethodGet {
 		filename := r.URL.Query().Get("filename")
@@ -60,7 +73,7 @@ func handleSync(w http.ResponseWriter, r *http.Request) {
 				http.Error(w, "Invalid Filename", http.StatusBadRequest)
 				return
 			}
-			path := filepath.Join(*dataDir, cleanName)
+			path := filepath.Join(s.DataDir, cleanName)
 			content, err := os.ReadFile(path)
 			if os.IsNotExist(err) {
 				http.Error(w, "Not Found", http.StatusNotFound)
@@ -77,7 +90,7 @@ func handleSync(w http.ResponseWriter, r *http.Request) {
 
 		// Case 2: List files with hashes
 		files := make(map[string]string)
-		entries, err := os.ReadDir(*dataDir)
+		entries, err := os.ReadDir(s.DataDir)
 		if err != nil {
 			log.Printf("ReadDir error: %v", err)
 			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
@@ -86,7 +99,7 @@ func handleSync(w http.ResponseWriter, r *http.Request) {
 
 		for _, entry := range entries {
 			if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".txt") {
-				content, err := os.ReadFile(filepath.Join(*dataDir, entry.Name()))
+				content, err := os.ReadFile(filepath.Join(s.DataDir, entry.Name()))
 				if err != nil {
 					log.Printf("ReadFile error (%s): %v", entry.Name(), err)
 					continue
@@ -119,7 +132,7 @@ func handleSync(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		serverPath := filepath.Join(*dataDir, filename)
+		serverPath := filepath.Join(s.DataDir, filename)
 		serverContentBytes, err := os.ReadFile(serverPath)
 		serverContent := ""
 		if err == nil {

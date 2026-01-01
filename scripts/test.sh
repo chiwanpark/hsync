@@ -12,9 +12,13 @@ LOG_B="$TEST_DIR/client_b.log"
 
 mkdir -p "$SERVER_DATA_DIR" "$CLIENT_A_DIR" "$CLIENT_B_DIR"
 
+# Build the binary
+mkdir -p bin
+go build -o bin/hsync ./cmd/hsync
+
 # Cleanup
-pkill -f bin/server || true
-pkill -f bin/client || true
+pkill -f "hsync server" || true
+pkill -f "hsync client" || true
 
 # Setup initial server data
 echo "Initial Note 1" > "$SERVER_DATA_DIR/note1.txt"
@@ -22,13 +26,13 @@ echo "Initial Note 2" > "$SERVER_DATA_DIR/note2.txt"
 
 # Start Server
 echo "Starting Server..."
-./bin/server -addr :8082 -dir "$SERVER_DATA_DIR" -key secret &
+./bin/hsync server -addr :8082 -dir "$SERVER_DATA_DIR" -key secret &
 SERVER_PID=$!
 sleep 1
 
 # Start Client A
 echo "Starting Client A..."
-./bin/client -server http://localhost:8082 -key secret -dir "$CLIENT_A_DIR" -interval 1s > "$LOG_A" 2>&1 &
+./bin/hsync client -server http://localhost:8082 -key secret -dir "$CLIENT_A_DIR" -interval 1s > "$LOG_A" 2>&1 &
 CLIENT_A_PID=$!
 sleep 1
 
@@ -42,7 +46,7 @@ fi
 
 # Start Client B
 echo "Starting Client B..."
-./bin/client -server http://localhost:8082 -key secret -dir "$CLIENT_B_DIR" -interval 1s > "$LOG_B" 2>&1 &
+./bin/hsync client -server http://localhost:8082 -key secret -dir "$CLIENT_B_DIR" -interval 1s > "$LOG_B" 2>&1 &
 CLIENT_B_PID=$!
 sleep 1
 
