@@ -24,4 +24,4 @@ jobs:
         go build -v -o bin/client ./cmd/client
 
     - name: Run Directory Sync Test
-      run: bash scripts/test.sh
+      run: make test

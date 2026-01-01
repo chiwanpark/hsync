@@ -26,6 +26,17 @@ Clone the repository and build the `hsync` binary:
 git clone <repository-url>
 cd hsync
 go mod tidy
+```
+
+You can build using `make`:
+
+```bash
+make build
+```
+
+Or manually:
+
+```bash
 go build -o bin/hsync ./cmd/hsync
 ```
 
@@ -70,6 +81,15 @@ The client runs on your local machine, monitoring a directory and syncing change
 **Example:**
 ```bash
 ./bin/hsync client -server http://myserver.com:8080 -dir ./my_notes -key mySecretKey -interval 2s
+```
+
+## Docker
+
+You can also run the server using Docker:
+
+```bash
+docker build -t hsync .
+docker run -p 8080:8080 -v $(pwd)/data:/app/data hsync
 ```
 
 ## How it Works
