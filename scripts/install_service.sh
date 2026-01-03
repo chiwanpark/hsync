@@ -1,6 +1,13 @@
 #!/bin/bash
 set -e
 
+if [ -z "$1" ]; then
+  echo "Usage: $0 <path-to-binary>"
+  exit 1
+fi
+
+SOURCE_BINARY="$1"
+
 # Detect OS
 OS="$(uname -s)"
 USER_BIN="$HOME/.local/bin"
@@ -8,10 +15,15 @@ BINARY_NAME="hsync"
 
 echo "Detected OS: $OS"
 
-# Build
-echo "Building binary..."
+if [ ! -f "$SOURCE_BINARY" ]; then
+    echo "Error: Binary file '$SOURCE_BINARY' not found."
+    exit 1
+fi
+
+echo "Installing binary from $SOURCE_BINARY..."
 mkdir -p "$USER_BIN"
-go build -o "$USER_BIN/$BINARY_NAME" ./cmd/hsync
+cp "$SOURCE_BINARY" "$USER_BIN/$BINARY_NAME"
+chmod +x "$USER_BIN/$BINARY_NAME"
 
 # Ensure bin exists in PATH (informational)
 if [[ ":$PATH:" != *":$USER_BIN:"* ]]; then
