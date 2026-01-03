@@ -15,8 +15,9 @@ RUN go mod download
 # Copy the source code
 COPY . .
 
+ARG VERSION=dev
 # Build the unified executable
-RUN CGO_ENABLED=0 GOOS=linux go build -o hsync ./cmd/hsync
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags "-X main.Version=$VERSION" -o hsync ./cmd/hsync
 
 # Final stage
 FROM alpine:latest

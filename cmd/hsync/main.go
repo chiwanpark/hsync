@@ -7,6 +7,8 @@ import (
 	"os"
 )
 
+var Version = "dev"
+
 func main() {
 	if len(os.Args) < 2 {
 		printUsage()
@@ -21,6 +23,8 @@ func main() {
 		client.Run(args)
 	case "server":
 		server.Run(args)
+	case "version":
+		fmt.Printf("hsync version %s\n", Version)
 	default:
 		fmt.Printf("Unknown subcommand: %s\n", subcommand)
 		printUsage()
@@ -33,4 +37,5 @@ func printUsage() {
 	fmt.Println("Commands:")
 	fmt.Println("  client    Run the sync client")
 	fmt.Println("  server    Run the sync server")
+	fmt.Println("  version   Print version information")
 }
