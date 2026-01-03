@@ -30,9 +30,18 @@ echo "Starting Server..."
 SERVER_PID=$!
 sleep 1
 
+# Generate Config for Client A
+CONFIG_A="$TEST_DIR/config_a.toml"
+cat <<EOF > "$CONFIG_A"
+server = "http://localhost:8082"
+key = "secret"
+dir = "$CLIENT_A_DIR"
+interval = "1s"
+EOF
+
 # Start Client A
 echo "Starting Client A..."
-./bin/hsync client -server http://localhost:8082 -key secret -dir "$CLIENT_A_DIR" -interval 1s > "$LOG_A" 2>&1 &
+./bin/hsync client -config "$CONFIG_A" > "$LOG_A" 2>&1 &
 CLIENT_A_PID=$!
 sleep 1
 
@@ -44,9 +53,18 @@ else
     exit 1
 fi
 
+# Generate Config for Client B
+CONFIG_B="$TEST_DIR/config_b.toml"
+cat <<EOF > "$CONFIG_B"
+server = "http://localhost:8082"
+key = "secret"
+dir = "$CLIENT_B_DIR"
+interval = "1s"
+EOF
+
 # Start Client B
 echo "Starting Client B..."
-./bin/hsync client -server http://localhost:8082 -key secret -dir "$CLIENT_B_DIR" -interval 1s > "$LOG_B" 2>&1 &
+./bin/hsync client -config "$CONFIG_B" > "$LOG_B" 2>&1 &
 CLIENT_B_PID=$!
 sleep 1
 

@@ -15,14 +15,23 @@ import (
 	"runtime"
 	"strings"
 	"time"
+
+	"github.com/pelletier/go-toml/v2"
 )
 
 // Config holds the client configuration
 type Config struct {
-	ServerURL string
-	Key       string
-	DirPath   string
-	Interval  time.Duration
+	ServerURL string        `toml:"server"`
+	Key       string        `toml:"key"`
+	DirPath   string        `toml:"dir"`
+	Interval  time.Duration `toml:"-"`
+}
+
+type configTOML struct {
+	ServerURL string `toml:"server"`
+	Key       string `toml:"key"`
+	DirPath   string `toml:"dir"`
+	Interval  string `toml:"interval"`
 }
 
 func getDefaultDir() string {
@@ -47,14 +56,60 @@ var (
 
 func Run(args []string) {
 	fs := flag.NewFlagSet("client", flag.ExitOnError)
-	var cfg Config
-	fs.StringVar(&cfg.ServerURL, "server", "http://localhost:8080", "Server URL")
-	fs.StringVar(&cfg.Key, "key", "default-secret", "Shared key for authentication")
-	fs.StringVar(&cfg.DirPath, "dir", getDefaultDir(), "Path to the local sync directory")
-	fs.DurationVar(&cfg.Interval, "interval", 5*time.Second, "Sync interval")
+	var configPath string
+	fs.StringVar(&configPath, "config", "", "Path to configuration file")
 
 	if err := fs.Parse(args); err != nil {
 		log.Fatal(err)
+	}
+
+	if configPath == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			log.Fatalf("Could not determine home directory: %v", err)
+		}
+		configPath = filepath.Join(home, ".config", "hsync.toml")
+	}
+
+	// Check if file exists
+	if _, err := os.Stat(configPath); os.IsNotExist(err) {
+		log.Fatalf("Configuration file not found: %s", configPath)
+	}
+
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		log.Fatalf("Error reading config file: %v", err)
+	}
+
+	var tomlCfg configTOML
+	if err := toml.Unmarshal(data, &tomlCfg); err != nil {
+		log.Fatalf("Error parsing config file: %v", err)
+	}
+
+	var cfg Config
+	cfg.ServerURL = tomlCfg.ServerURL
+	cfg.Key = tomlCfg.Key
+	cfg.DirPath = tomlCfg.DirPath
+
+	// Set defaults if missing in TOML
+	if cfg.ServerURL == "" {
+		cfg.ServerURL = "http://localhost:8080"
+	}
+	if cfg.Key == "" {
+		cfg.Key = "default-secret"
+	}
+	if cfg.DirPath == "" {
+		cfg.DirPath = getDefaultDir()
+	}
+
+	if tomlCfg.Interval != "" {
+		parsedDuration, err := time.ParseDuration(tomlCfg.Interval)
+		if err != nil {
+			log.Fatalf("Invalid interval format: %v", err)
+		}
+		cfg.Interval = parsedDuration
+	} else {
+		cfg.Interval = 5 * time.Second
 	}
 
 	// Ensure local dir exists
@@ -108,7 +163,7 @@ func syncWithServer(cfg *Config) {
 	// 2. Compare and Download if needed
 	for filename, serverHash := range serverFiles {
 		localBaseContent, exists := baseContents[filename]
-		
+
 		// If we don't have it, or our base is outdated
 		if !exists || utils.CalculateHash(localBaseContent) != serverHash {
 			// Let's implement: Download content.
@@ -250,3 +305,4 @@ func syncFile(cfg *Config, filename, base, current string) {
 
 	baseContents[filename] = syncResp.Synced
 }
+
