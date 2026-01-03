@@ -2,6 +2,7 @@ package client
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -21,17 +22,11 @@ import (
 
 // Config holds the client configuration
 type Config struct {
-	ServerURL string        `toml:"server"`
-	Key       string        `toml:"key"`
-	DirPath   string        `toml:"dir"`
-	Interval  time.Duration `toml:"-"`
-}
-
-type configTOML struct {
-	ServerURL string `toml:"server"`
-	Key       string `toml:"key"`
-	DirPath   string `toml:"dir"`
-	Interval  string `toml:"interval"`
+	ServerURL          string `toml:"server"`
+	Key                string `toml:"key"`
+	DirPath            string `toml:"dir"`
+	Interval           string `toml:"interval"`
+	InsecureSkipVerify bool   `toml:"insecureSkipVerify"`
 }
 
 func getDefaultDir() string {
@@ -53,6 +48,16 @@ func getDefaultDir() string {
 var (
 	baseContents = make(map[string]string)
 )
+
+func getHTTPClient(cfg *Config) *http.Client {
+	if cfg.InsecureSkipVerify {
+		tr := &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		}
+		return &http.Client{Transport: tr}
+	}
+	return http.DefaultClient
+}
 
 func Run(args []string) {
 	fs := flag.NewFlagSet("client", flag.ExitOnError)
@@ -81,15 +86,10 @@ func Run(args []string) {
 		log.Fatalf("Error reading config file: %v", err)
 	}
 
-	var tomlCfg configTOML
-	if err := toml.Unmarshal(data, &tomlCfg); err != nil {
+	var cfg Config
+	if err := toml.Unmarshal(data, &cfg); err != nil {
 		log.Fatalf("Error parsing config file: %v", err)
 	}
-
-	var cfg Config
-	cfg.ServerURL = tomlCfg.ServerURL
-	cfg.Key = tomlCfg.Key
-	cfg.DirPath = tomlCfg.DirPath
 
 	// Set defaults if missing in TOML
 	if cfg.ServerURL == "" {
@@ -102,14 +102,15 @@ func Run(args []string) {
 		cfg.DirPath = getDefaultDir()
 	}
 
-	if tomlCfg.Interval != "" {
-		parsedDuration, err := time.ParseDuration(tomlCfg.Interval)
-		if err != nil {
-			log.Fatalf("Invalid interval format: %v", err)
-		}
-		cfg.Interval = parsedDuration
+	var interval time.Duration
+	if cfg.Interval == "" {
+		interval = 5 * time.Second
 	} else {
-		cfg.Interval = 5 * time.Second
+		var err error
+		interval, err = time.ParseDuration(cfg.Interval)
+		if err != nil {
+			log.Fatalf("Error parsing interval: %v", err)
+		}
 	}
 
 	// Ensure local dir exists
@@ -118,22 +119,27 @@ func Run(args []string) {
 	}
 
 	log.Printf("Starting client syncing to %s with dir %s", cfg.ServerURL, cfg.DirPath)
+	if cfg.InsecureSkipVerify {
+		log.Println("WARNING: TLS certificate verification skipped")
+	}
+
+	httpClient := getHTTPClient(&cfg)
 
 	// 3-1. Initial Sync
-	syncWithServer(&cfg)
+	syncWithServer(&cfg, httpClient)
 
-	ticker := time.NewTicker(cfg.Interval)
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	for range ticker.C {
 		// Periodically check server for updates
-		syncWithServer(&cfg)
+		syncWithServer(&cfg, httpClient)
 		// Check local changes
-		checkAndUpload(&cfg)
+		checkAndUpload(&cfg, httpClient)
 	}
 }
 
-func syncWithServer(cfg *Config) {
+func syncWithServer(cfg *Config, client *http.Client) {
 	// 1. Get List of Hashes
 	req, err := http.NewRequest("GET", cfg.ServerURL+"/sync", nil)
 	if err != nil {
@@ -142,7 +148,7 @@ func syncWithServer(cfg *Config) {
 	}
 	req.Header.Set("X-Sync-Key", cfg.Key)
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		log.Printf("Failed to list files: %v", err)
 		return
@@ -167,7 +173,7 @@ func syncWithServer(cfg *Config) {
 		// If we don't have it, or our base is outdated
 		if !exists || utils.CalculateHash(localBaseContent) != serverHash {
 			// Let's implement: Download content.
-			content, err := downloadFile(cfg, filename)
+			content, err := downloadFile(cfg, client, filename)
 			if err != nil {
 				log.Printf("Failed to download %s: %v", filename, err)
 				continue
@@ -196,14 +202,14 @@ func syncWithServer(cfg *Config) {
 	}
 }
 
-func downloadFile(cfg *Config, filename string) (string, error) {
+func downloadFile(cfg *Config, client *http.Client, filename string) (string, error) {
 	req, err := http.NewRequest("GET", cfg.ServerURL+"/sync?filename="+filename, nil)
 	if err != nil {
 		return "", err
 	}
 	req.Header.Set("X-Sync-Key", cfg.Key)
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -220,7 +226,7 @@ func downloadFile(cfg *Config, filename string) (string, error) {
 	return string(data), nil
 }
 
-func checkAndUpload(cfg *Config) {
+func checkAndUpload(cfg *Config, client *http.Client) {
 	entries, err := os.ReadDir(cfg.DirPath)
 	if err != nil {
 		log.Printf("Error reading directory: %v", err)
@@ -252,11 +258,11 @@ func checkAndUpload(cfg *Config) {
 		}
 
 		log.Printf("File changed: %s", filename)
-		syncFile(cfg, filename, base, currentContent)
+		syncFile(cfg, client, filename, base, currentContent)
 	}
 }
 
-func syncFile(cfg *Config, filename, base, current string) {
+func syncFile(cfg *Config, client *http.Client, filename, base, current string) {
 	reqBody := protocol.SyncRequest{
 		Filename: filename,
 		Base:     base,
@@ -272,7 +278,7 @@ func syncFile(cfg *Config, filename, base, current string) {
 	req.Header.Set("X-Sync-Key", cfg.Key)
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		log.Printf("Upload failed for %s: %v", filename, err)
 		return
@@ -305,4 +311,3 @@ func syncFile(cfg *Config, filename, base, current string) {
 
 	baseContents[filename] = syncResp.Synced
 }
-
