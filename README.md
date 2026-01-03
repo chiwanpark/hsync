@@ -66,21 +66,36 @@ The server manages the central copy of the notes and handles merge operations.
 
 ### Client
 
-The client runs on your local machine, monitoring a directory and syncing changes to the server.
+The client runs on your local machine, monitoring a directory and syncing changes to the server. Configuration is managed via a TOML file.
 
 ```bash
 ./bin/hsync client [flags]
 ```
 
 **Flags:**
-- `-server`: URL of the hsync server (default `"http://localhost:8080"`).
-- `-dir`: Path to the local directory to synchronize (default: platform-specific Heynote notes path).
-- `-key`: Shared secret key matching the server (default `"default-secret"`).
-- `-interval`: Duration to wait between checks (default `5s`).
+- `-config`: Path to the configuration file (default: `${HOME}/.config/hsync.toml`).
+
+**Configuration File (`hsync.toml`):**
+
+The client uses a TOML file for configuration. Below is an example:
+
+```toml
+server = "http://localhost:8080"      # URL of the hsync server
+key = "mySecretKey"                   # Shared secret key matching the server
+dir = "./my_notes"                    # Path to the local directory to synchronize
+interval = "2s"                       # Duration to wait between checks (e.g., "5s", "1m")
+```
 
 **Example:**
+
+Run with default config path (`~/.config/hsync.toml`):
 ```bash
-./bin/hsync client -server http://myserver.com:8080 -dir ./my_notes -key mySecretKey -interval 2s
+./bin/hsync client
+```
+
+Run with a specific config file:
+```bash
+./bin/hsync client -config my_config.toml
 ```
 
 ## Docker
