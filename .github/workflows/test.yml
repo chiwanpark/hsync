@@ -19,9 +19,7 @@ jobs:
 
     - name: Build
       run: |
-        go mod tidy
-        go build -v -o bin/server ./cmd/server
-        go build -v -o bin/client ./cmd/client
+        go build -v -o bin/hsync ./cmd/hsync
 
     - name: Run Directory Sync Test
       run: make test
