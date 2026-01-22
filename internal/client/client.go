@@ -126,20 +126,20 @@ func Run(args []string) {
 	httpClient := getHTTPClient(&cfg)
 
 	// 3-1. Initial Sync
-	syncWithServer(&cfg, httpClient)
+	syncWithServer(&cfg, httpClient, true)
 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	for range ticker.C {
 		// Periodically check server for updates
-		syncWithServer(&cfg, httpClient)
+		syncWithServer(&cfg, httpClient, false)
 		// Check local changes
 		checkAndUpload(&cfg, httpClient)
 	}
 }
 
-func syncWithServer(cfg *Config, client *http.Client) {
+func syncWithServer(cfg *Config, client *http.Client, force bool) {
 	// 1. Get List of Hashes
 	req, err := http.NewRequest("GET", cfg.ServerURL+"/sync", nil)
 	if err != nil {
@@ -171,7 +171,7 @@ func syncWithServer(cfg *Config, client *http.Client) {
 		localBaseContent, exists := baseContents[filename]
 
 		// If we don't have it, or our base is outdated
-		if !exists || utils.CalculateHash(localBaseContent) != serverHash {
+		if force || !exists || utils.CalculateHash(localBaseContent) != serverHash {
 			// Let's implement: Download content.
 			content, err := downloadFile(cfg, client, filename)
 			if err != nil {
@@ -184,6 +184,16 @@ func syncWithServer(cfg *Config, client *http.Client) {
 
 			// Update local file IF it was clean (same as old base)
 			localPath := filepath.Join(cfg.DirPath, filename)
+
+			if force {
+				if err := os.WriteFile(localPath, []byte(content), 0644); err != nil {
+					log.Printf("Error writing forced file %s: %v", filename, err)
+				} else {
+					log.Printf("Force downloaded file: %s", filename)
+				}
+				continue
+			}
+
 			currentBytes, err := os.ReadFile(localPath)
 			if os.IsNotExist(err) {
 				// File doesn't exist locally, just write it
