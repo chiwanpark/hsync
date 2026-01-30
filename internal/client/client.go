@@ -213,27 +213,47 @@ func syncWithServer(cfg *Config, client *http.Client, force bool) {
 }
 
 func downloadFile(cfg *Config, client *http.Client, filename string) (string, error) {
-	req, err := http.NewRequest("GET", cfg.ServerURL+"/sync?filename="+filename, nil)
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("X-Sync-Key", cfg.Key)
+	var lastErr error
+	maxRetries := 10
+	backoff := 500 * time.Millisecond
 
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
+	for i := 0; i <= maxRetries; i++ {
+		if i > 0 {
+			time.Sleep(backoff)
+			backoff *= 2
+		}
 
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("status %d", resp.StatusCode)
+		req, err := http.NewRequest("GET", cfg.ServerURL+"/sync?filename="+filename, nil)
+		if err != nil {
+			return "", err
+		}
+		req.Header.Set("X-Sync-Key", cfg.Key)
+
+		resp, err := client.Do(req)
+		if err != nil {
+			lastErr = err
+			log.Printf("Attempt %d failed to download %s: %v", i+1, filename, err)
+			continue
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			lastErr = fmt.Errorf("status %d", resp.StatusCode)
+			log.Printf("Attempt %d failed to download %s: status %d", i+1, filename, resp.StatusCode)
+			continue
+		}
+
+		data, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			lastErr = err
+			log.Printf("Attempt %d failed to read body for %s: %v", i+1, filename, err)
+			continue
+		}
+		return string(data), nil
 	}
 
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
-	return string(data), nil
+	return "", fmt.Errorf("failed to download %s after %d attempts: %v", filename, maxRetries+1, lastErr)
 }
 
 func checkAndUpload(cfg *Config, client *http.Client) {
