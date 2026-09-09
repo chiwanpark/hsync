@@ -13,6 +13,7 @@ clean:
 	rm -rf $(BUILD_DIR)
 
 test: build
+	go test ./...
 	./scripts/test.sh
 
 install-service:

@@ -23,6 +23,8 @@ pkill -f "hsync client" || true
 # Setup initial server data
 echo "Initial Note 1" > "$SERVER_DATA_DIR/note1.txt"
 echo "Initial Note 2" > "$SERVER_DATA_DIR/note2.txt"
+mkdir -p "$SERVER_DATA_DIR/projects/alpha"
+echo "Initial Nested Note" > "$SERVER_DATA_DIR/projects/alpha/nested.txt"
 
 # Start Server
 echo "Starting Server..."
@@ -50,6 +52,14 @@ if [ -f "$CLIENT_A_DIR/note1.txt" ] && [ -f "$CLIENT_A_DIR/note2.txt" ]; then
     echo "Client A downloaded initial files."
 else
     echo "Client A failed to download files."
+    exit 1
+fi
+
+# Verify A downloaded nested files
+if grep -q "Initial Nested Note" "$CLIENT_A_DIR/projects/alpha/nested.txt"; then
+    echo "Client A downloaded initial nested file."
+else
+    echo "Client A failed to download nested file."
     exit 1
 fi
 
@@ -105,6 +115,67 @@ sleep 2
 
 echo "Server content for note2.txt:"
 cat "$SERVER_DATA_DIR/note2.txt"
+
+# Scenario 4: Nested file propagation between clients
+if grep -q "Initial Nested Note" "$CLIENT_B_DIR/projects/alpha/nested.txt"; then
+    echo "Client B downloaded initial nested file."
+else
+    echo "Client B failed to download nested file."
+    exit 1
+fi
+
+echo "Client A modifies nested file..."
+echo "Nested modified by A" > "$CLIENT_A_DIR/projects/alpha/nested.txt"
+sleep 2
+
+if grep -q "Nested modified by A" "$SERVER_DATA_DIR/projects/alpha/nested.txt"; then
+    echo "Server received update for nested file."
+else
+    echo "Server failed to update nested file."
+    exit 1
+fi
+
+if grep -q "Nested modified by A" "$CLIENT_B_DIR/projects/alpha/nested.txt"; then
+    echo "Client B received update for nested file."
+else
+    echo "Client B failed to receive nested file update."
+    exit 1
+fi
+
+# Scenario 5: Create new nested file on B
+echo "Client B creates a deeply nested file..."
+mkdir -p "$CLIENT_B_DIR/projects/beta/deep"
+echo "Deep note by B" > "$CLIENT_B_DIR/projects/beta/deep/note4.txt"
+sleep 2
+
+if grep -q "Deep note by B" "$SERVER_DATA_DIR/projects/beta/deep/note4.txt"; then
+    echo "Server received new nested file projects/beta/deep/note4.txt"
+else
+    echo "Server failed to receive new nested file."
+    exit 1
+fi
+
+if grep -q "Deep note by B" "$CLIENT_A_DIR/projects/beta/deep/note4.txt"; then
+    echo "Client A downloaded new nested file."
+else
+    echo "Client A failed to download new nested file."
+    exit 1
+fi
+
+# Scenario 6: Reject path traversal attempts
+echo "Checking path traversal rejection..."
+TRAVERSAL_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -H "X-Sync-Key: secret" \
+    "http://localhost:8082/sync?filename=..%2F..%2Fescape.txt")
+if [ "$TRAVERSAL_STATUS" = "404" ] || [ "$TRAVERSAL_STATUS" = "400" ]; then
+    echo "Server rejected traversal request (status $TRAVERSAL_STATUS)."
+else
+    echo "Server did not reject traversal request (status $TRAVERSAL_STATUS)."
+    exit 1
+fi
+if [ -f "$TEST_DIR/escape.txt" ]; then
+    echo "Traversal escaped the data directory."
+    exit 1
+fi
 
 # Cleanup
 kill $SERVER_PID $CLIENT_A_PID $CLIENT_B_PID

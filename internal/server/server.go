@@ -9,8 +9,6 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"path/filepath"
-	"strings"
 	"sync"
 )
 
@@ -67,13 +65,12 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 
 		// Case 1: Download specific file content
 		if filename != "" {
-			// Security check
-			cleanName := filepath.Base(filename)
-			if cleanName == "." || cleanName == "/" || !strings.HasSuffix(cleanName, ".txt") {
+			// Security check: reject paths escaping the data directory
+			path, err := utils.ResolveSyncPath(s.DataDir, filename)
+			if err != nil {
 				http.Error(w, "Invalid Filename", http.StatusBadRequest)
 				return
 			}
-			path := filepath.Join(s.DataDir, cleanName)
 			content, err := os.ReadFile(path)
 			if os.IsNotExist(err) {
 				http.Error(w, "Not Found", http.StatusNotFound)
@@ -88,24 +85,22 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Case 2: List files with hashes
-		files := make(map[string]string)
-		entries, err := os.ReadDir(s.DataDir)
+		// Case 2: List files with hashes, including nested directories
+		names, err := utils.ListTextFiles(s.DataDir)
 		if err != nil {
-			log.Printf("ReadDir error: %v", err)
+			log.Printf("ListTextFiles error: %v", err)
 			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 			return
 		}
 
-		for _, entry := range entries {
-			if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".txt") {
-				content, err := os.ReadFile(filepath.Join(s.DataDir, entry.Name()))
-				if err != nil {
-					log.Printf("ReadFile error (%s): %v", entry.Name(), err)
-					continue
-				}
-				files[entry.Name()] = utils.CalculateHash(string(content))
+		files := make(map[string]string)
+		for _, name := range names {
+			content, err := os.ReadFile(utils.LocalPath(s.DataDir, name))
+			if err != nil {
+				log.Printf("ReadFile error (%s): %v", name, err)
+				continue
 			}
+			files[name] = utils.CalculateHash(string(content))
 		}
 
 		w.Header().Set("Content-Type", "application/json")
@@ -120,19 +115,14 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Security check: simple sanitize
-		filename := filepath.Base(req.Filename)
-		if filename == "." || filename == "/" {
+		// Security check: reject paths escaping the data directory
+		filename, err := utils.NormalizeSyncPath(req.Filename)
+		if err != nil {
 			http.Error(w, "Invalid Filename", http.StatusBadRequest)
 			return
 		}
-		// Enforce .txt extension for safety/simplicity per requirement context
-		if !strings.HasSuffix(filename, ".txt") {
-			http.Error(w, "Only .txt files allowed", http.StatusBadRequest)
-			return
-		}
 
-		serverPath := filepath.Join(s.DataDir, filename)
+		serverPath := utils.LocalPath(s.DataDir, filename)
 		serverContentBytes, err := os.ReadFile(serverPath)
 		serverContent := ""
 		if err == nil {
@@ -152,7 +142,7 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Save merged content
-		if err := os.WriteFile(serverPath, []byte(merged), 0644); err != nil {
+		if err := utils.WriteSyncFile(serverPath, merged); err != nil {
 			log.Printf("Write error: %v", err)
 			http.Error(w, "Write Error", http.StatusInternalServerError)
 			return

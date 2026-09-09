@@ -109,7 +109,7 @@ docker run -p 8080:8080 -v $(pwd)/data:/app/data hsync
 
 ## How it Works
 
-1. **Initialization:** When the client starts, it downloads the current state of all text files from the server.
+1. **Initialization:** When the client starts, it downloads the current state of all text files from the server, including files in nested directories.
 2. **Monitoring:** The client checks the local files periodically (defined by `-interval`).
 3. **Syncing:**
    - If a local file is modified, the client sends a patch request to the server.
@@ -119,7 +119,13 @@ docker run -p 8080:8080 -v $(pwd)/data:/app/data hsync
 
 ## Development & Testing
 
-You can run the provided test script to simulate a sync session with one server and two clients:
+Run the unit tests and the end-to-end script (one server, two clients) with:
+
+```bash
+make test
+```
+
+You can also run the end-to-end script directly:
 
 ```bash
 ./scripts/test.sh

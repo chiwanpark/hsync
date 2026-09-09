@@ -11,10 +11,10 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
-	"strings"
 	"time"
 
 	"github.com/pelletier/go-toml/v2"
@@ -168,6 +168,13 @@ func syncWithServer(cfg *Config, client *http.Client, force bool) {
 
 	// 2. Compare and Download if needed
 	for filename, serverHash := range serverFiles {
+		// Reject paths escaping the local directory
+		localPath, err := utils.ResolveSyncPath(cfg.DirPath, filename)
+		if err != nil {
+			log.Printf("Skipping invalid remote path: %s", filename)
+			continue
+		}
+
 		localBaseContent, exists := baseContents[filename]
 
 		// If we don't have it, or our base is outdated
@@ -183,10 +190,8 @@ func syncWithServer(cfg *Config, client *http.Client, force bool) {
 			baseContents[filename] = content
 
 			// Update local file IF it was clean (same as old base)
-			localPath := filepath.Join(cfg.DirPath, filename)
-
 			if force {
-				if err := os.WriteFile(localPath, []byte(content), 0644); err != nil {
+				if err := utils.WriteSyncFile(localPath, content); err != nil {
 					log.Printf("Error writing forced file %s: %v", filename, err)
 				} else {
 					log.Printf("Force downloaded file: %s", filename)
@@ -197,13 +202,19 @@ func syncWithServer(cfg *Config, client *http.Client, force bool) {
 			currentBytes, err := os.ReadFile(localPath)
 			if os.IsNotExist(err) {
 				// File doesn't exist locally, just write it
-				os.WriteFile(localPath, []byte(content), 0644)
-				log.Printf("Downloaded new file: %s", filename)
+				if err := utils.WriteSyncFile(localPath, content); err != nil {
+					log.Printf("Error writing new file %s: %v", filename, err)
+				} else {
+					log.Printf("Downloaded new file: %s", filename)
+				}
 			} else if err == nil {
 				if exists && string(currentBytes) == localBaseContent {
 					// Local was clean, safe to update
-					os.WriteFile(localPath, []byte(content), 0644)
-					log.Printf("Updated file from server: %s", filename)
+					if err := utils.WriteSyncFile(localPath, content); err != nil {
+						log.Printf("Error writing file %s: %v", filename, err)
+					} else {
+						log.Printf("Updated file from server: %s", filename)
+					}
 				} else {
 					log.Printf("Skipping download for %s (local changes detected). Will attempt merge via upload.", filename)
 				}
@@ -223,7 +234,8 @@ func downloadFile(cfg *Config, client *http.Client, filename string) (string, er
 			backoff *= 2
 		}
 
-		req, err := http.NewRequest("GET", cfg.ServerURL+"/sync?filename="+filename, nil)
+		query := url.Values{"filename": {filename}}.Encode()
+		req, err := http.NewRequest("GET", cfg.ServerURL+"/sync?"+query, nil)
 		if err != nil {
 			return "", err
 		}
@@ -257,20 +269,14 @@ func downloadFile(cfg *Config, client *http.Client, filename string) (string, er
 }
 
 func checkAndUpload(cfg *Config, client *http.Client) {
-	entries, err := os.ReadDir(cfg.DirPath)
+	filenames, err := utils.ListTextFiles(cfg.DirPath)
 	if err != nil {
 		log.Printf("Error reading directory: %v", err)
 		return
 	}
 
-	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".txt") {
-			continue
-		}
-
-		filename := entry.Name()
-		localPath := filepath.Join(cfg.DirPath, filename)
-		contentBytes, err := os.ReadFile(localPath)
+	for _, filename := range filenames {
+		contentBytes, err := os.ReadFile(utils.LocalPath(cfg.DirPath, filename))
 		if err != nil {
 			log.Printf("Error reading %s: %v", filename, err)
 			continue
@@ -329,8 +335,8 @@ func syncFile(cfg *Config, client *http.Client, filename, base, current string) 
 
 	// Update local file and base
 	if syncResp.Synced != current {
-		localPath := filepath.Join(cfg.DirPath, filename)
-		if err := os.WriteFile(localPath, []byte(syncResp.Synced), 0644); err != nil {
+		localPath := utils.LocalPath(cfg.DirPath, filename)
+		if err := utils.WriteSyncFile(localPath, syncResp.Synced); err != nil {
 			log.Printf("Error writing merged file %s: %v", filename, err)
 			return
 		}
