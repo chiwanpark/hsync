@@ -39,6 +39,7 @@ server = "http://localhost:8082"
 key = "secret"
 dir = "$CLIENT_A_DIR"
 interval = "1s"
+state = "$TEST_DIR/state_a.json"
 EOF
 
 # Start Client A
@@ -70,6 +71,7 @@ server = "http://localhost:8082"
 key = "secret"
 dir = "$CLIENT_B_DIR"
 interval = "1s"
+state = "$TEST_DIR/state_b.json"
 EOF
 
 # Start Client B
@@ -159,6 +161,72 @@ if grep -q "Deep note by B" "$CLIENT_A_DIR/projects/beta/deep/note4.txt"; then
     echo "Client A downloaded new nested file."
 else
     echo "Client A failed to download new nested file."
+    exit 1
+fi
+
+echo "Client A moves note3.txt into notes/archive/..."
+mkdir -p "$CLIENT_A_DIR/notes/archive"
+mv "$CLIENT_A_DIR/note3.txt" "$CLIENT_A_DIR/notes/archive/note3.txt"
+sleep 4
+
+if [ -f "$SERVER_DATA_DIR/notes/archive/note3.txt" ] && [ ! -f "$SERVER_DATA_DIR/note3.txt" ]; then
+    echo "Server moved note3.txt into notes/archive."
+else
+    echo "Server failed to move note3.txt."
+    exit 1
+fi
+
+if [ -f "$CLIENT_B_DIR/notes/archive/note3.txt" ] && [ ! -f "$CLIENT_B_DIR/note3.txt" ]; then
+    echo "Client B moved note3.txt into notes/archive."
+else
+    echo "Client B failed to move note3.txt."
+    exit 1
+fi
+
+echo "Restarting Client A to check the move is not resurrected..."
+kill $CLIENT_A_PID
+wait $CLIENT_A_PID 2>/dev/null || true
+./bin/hsync client -config "$CONFIG_A" > "$LOG_A" 2>&1 &
+CLIENT_A_PID=$!
+sleep 3
+
+if [ -f "$CLIENT_A_DIR/note3.txt" ]; then
+    echo "Client A resurrected the moved note."
+    exit 1
+else
+    echo "Client A kept the move after restart."
+fi
+
+echo "Client B deletes the moved note..."
+rm "$CLIENT_B_DIR/notes/archive/note3.txt"
+sleep 4
+
+if [ -f "$SERVER_DATA_DIR/notes/archive/note3.txt" ]; then
+    echo "Server kept a deleted note."
+    exit 1
+else
+    echo "Server removed the deleted note."
+fi
+
+if [ -f "$CLIENT_A_DIR/notes/archive/note3.txt" ]; then
+    echo "Client A kept a deleted note."
+    exit 1
+else
+    echo "Client A removed the deleted note."
+fi
+
+echo "Both clients move note1.txt into shared/..."
+mkdir -p "$CLIENT_A_DIR/shared" "$CLIENT_B_DIR/shared"
+mv "$CLIENT_A_DIR/note1.txt" "$CLIENT_A_DIR/shared/note1.txt"
+mv "$CLIENT_B_DIR/note1.txt" "$CLIENT_B_DIR/shared/note1.txt"
+sleep 5
+
+MOVED_LINES=$(wc -l < "$SERVER_DATA_DIR/shared/note1.txt")
+if [ "$MOVED_LINES" -eq 1 ]; then
+    echo "Server kept a single copy of the moved note."
+else
+    echo "Server duplicated the moved note ($MOVED_LINES lines)."
+    cat "$SERVER_DATA_DIR/shared/note1.txt"
     exit 1
 fi
 

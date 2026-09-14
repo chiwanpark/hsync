@@ -1,20 +1,18 @@
 package client
 
 import (
-	"bytes"
 	"crypto/tls"
-	"encoding/json"
+	"errors"
 	"flag"
-	"fmt"
 	"hsync/internal/protocol"
 	"hsync/internal/utils"
-	"io"
 	"log"
 	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/pelletier/go-toml/v2"
@@ -25,8 +23,12 @@ type Config struct {
 	ServerURL          string `toml:"server"`
 	Key                string `toml:"key"`
 	DirPath            string `toml:"dir"`
+	StatePath          string `toml:"state"`
 	Interval           string `toml:"interval"`
+	Timeout            string `toml:"timeout"`
 	InsecureSkipVerify bool   `toml:"insecureSkipVerify"`
+
+	caseInsensitive bool
 }
 
 func getDefaultDir() string {
@@ -45,18 +47,14 @@ func getDefaultDir() string {
 	}
 }
 
-var (
-	baseContents = make(map[string]string)
-)
-
-func getHTTPClient(cfg *Config) *http.Client {
+func getHTTPClient(cfg *Config, timeout time.Duration) *http.Client {
+	client := &http.Client{Timeout: timeout}
 	if cfg.InsecureSkipVerify {
-		tr := &http.Transport{
+		client.Transport = &http.Transport{
 			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 		}
-		return &http.Client{Transport: tr}
 	}
-	return http.DefaultClient
+	return client
 }
 
 func Run(args []string) {
@@ -101,6 +99,9 @@ func Run(args []string) {
 	if cfg.DirPath == "" {
 		cfg.DirPath = getDefaultDir()
 	}
+	if cfg.StatePath == "" {
+		cfg.StatePath = defaultStatePath(cfg.DirPath)
+	}
 
 	var interval time.Duration
 	if cfg.Interval == "" {
@@ -113,6 +114,15 @@ func Run(args []string) {
 		}
 	}
 
+	timeout := 60 * time.Second
+	if cfg.Timeout != "" {
+		parsed, err := time.ParseDuration(cfg.Timeout)
+		if err != nil {
+			log.Fatalf("Error parsing timeout: %v", err)
+		}
+		timeout = parsed
+	}
+
 	// Ensure local dir exists
 	if err := os.MkdirAll(cfg.DirPath, 0755); err != nil {
 		log.Fatal(err)
@@ -123,227 +133,409 @@ func Run(args []string) {
 		log.Println("WARNING: TLS certificate verification skipped")
 	}
 
-	httpClient := getHTTPClient(&cfg)
+	cfg.caseInsensitive = utils.IsCaseInsensitiveDir(cfg.DirPath)
+	if cfg.caseInsensitive {
+		log.Println("Note directory is case insensitive; notes whose names differ only in letter case are skipped")
+	}
 
-	// 3-1. Initial Sync
-	syncWithServer(&cfg, httpClient, true)
+	httpClient := getHTTPClient(&cfg, timeout)
+
+	st, existed, err := loadState(cfg.StatePath)
+	if err != nil {
+		log.Fatalf("Error loading sync state from %s: %v", cfg.StatePath, err)
+	}
+	if existed {
+		log.Printf("Loaded sync state for %d files from %s", len(st.Base), cfg.StatePath)
+	} else {
+		log.Printf("No sync state found, downloading server copy into %s", cfg.DirPath)
+	}
+
+	runCycle(&cfg, httpClient, st, !existed)
 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	for range ticker.C {
-		// Periodically check server for updates
-		syncWithServer(&cfg, httpClient, false)
-		// Check local changes
-		checkAndUpload(&cfg, httpClient)
+		runCycle(&cfg, httpClient, st, false)
 	}
 }
 
-func syncWithServer(cfg *Config, client *http.Client, force bool) {
-	// 1. Get List of Hashes
-	req, err := http.NewRequest("GET", cfg.ServerURL+"/sync", nil)
-	if err != nil {
-		log.Printf("Error creating request: %v", err)
-		return
-	}
-	req.Header.Set("X-Sync-Key", cfg.Key)
-
-	resp, err := client.Do(req)
+func runCycle(cfg *Config, client *http.Client, st *syncState, force bool) {
+	serverFiles, err := fetchFileList(cfg, client)
 	if err != nil {
 		log.Printf("Failed to list files: %v", err)
 		return
 	}
-	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		log.Printf("Server returned status: %d", resp.StatusCode)
+	tombstones, err := fetchTombstones(cfg, client)
+	if err != nil {
+		log.Printf("Failed to list server deletions: %v", err)
+		tombstones = map[string]protocol.Tombstone{}
+	}
+
+	paths, ok := localPaths(cfg)
+	if !ok {
 		return
 	}
 
-	var serverFiles map[string]string // filename -> hash
-	if err := json.NewDecoder(resp.Body).Decode(&serverFiles); err != nil {
-		log.Printf("Error decoding file list: %v", err)
-		return
+	if force {
+		for name, tombstone := range tombstones {
+			st.Tombstones[name] = tombstone.DeletedAt
+		}
+		pullFromServer(cfg, client, st, serverFiles, paths, nil, true)
+
+		if paths, ok = localPaths(cfg); !ok {
+			return
+		}
+		pushLocalChanges(cfg, client, st, serverFiles, paths)
+	} else {
+		applyTombstones(cfg, st, tombstones, paths)
+
+		if paths, ok = localPaths(cfg); !ok {
+			return
+		}
+		handled := pushLocalChanges(cfg, client, st, serverFiles, paths)
+
+		if paths, ok = localPaths(cfg); !ok {
+			return
+		}
+		pullFromServer(cfg, client, st, serverFiles, paths, handled, false)
 	}
 
-	// 2. Compare and Download if needed
-	for filename, serverHash := range serverFiles {
-		// Reject paths escaping the local directory
-		localPath, err := utils.ResolveSyncPath(cfg.DirPath, filename)
-		if err != nil {
-			log.Printf("Skipping invalid remote path: %s", filename)
-			continue
-		}
+	known := make(map[string]int64, len(tombstones))
+	for name, tombstone := range tombstones {
+		known[name] = tombstone.DeletedAt
+	}
+	st.pruneTombstones(known)
 
-		localBaseContent, exists := baseContents[filename]
-
-		// If we don't have it, or our base is outdated
-		if force || !exists || utils.CalculateHash(localBaseContent) != serverHash {
-			// Let's implement: Download content.
-			content, err := downloadFile(cfg, client, filename)
-			if err != nil {
-				log.Printf("Failed to download %s: %v", filename, err)
-				continue
-			}
-
-			// Update base
-			baseContents[filename] = content
-
-			// Update local file IF it was clean (same as old base)
-			if force {
-				if err := utils.WriteSyncFile(localPath, content); err != nil {
-					log.Printf("Error writing forced file %s: %v", filename, err)
-				} else {
-					log.Printf("Force downloaded file: %s", filename)
-				}
-				continue
-			}
-
-			currentBytes, err := os.ReadFile(localPath)
-			if os.IsNotExist(err) {
-				// File doesn't exist locally, just write it
-				if err := utils.WriteSyncFile(localPath, content); err != nil {
-					log.Printf("Error writing new file %s: %v", filename, err)
-				} else {
-					log.Printf("Downloaded new file: %s", filename)
-				}
-			} else if err == nil {
-				if exists && string(currentBytes) == localBaseContent {
-					// Local was clean, safe to update
-					if err := utils.WriteSyncFile(localPath, content); err != nil {
-						log.Printf("Error writing file %s: %v", filename, err)
-					} else {
-						log.Printf("Updated file from server: %s", filename)
-					}
-				} else {
-					log.Printf("Skipping download for %s (local changes detected). Will attempt merge via upload.", filename)
-				}
-			}
-		}
+	if err := st.save(); err != nil {
+		log.Printf("Error saving sync state: %v", err)
 	}
 }
 
-func downloadFile(cfg *Config, client *http.Client, filename string) (string, error) {
-	var lastErr error
-	maxRetries := 10
-	backoff := 500 * time.Millisecond
-
-	for i := 0; i <= maxRetries; i++ {
-		if i > 0 {
-			time.Sleep(backoff)
-			backoff *= 2
-		}
-
-		query := url.Values{"filename": {filename}}.Encode()
-		req, err := http.NewRequest("GET", cfg.ServerURL+"/sync?"+query, nil)
-		if err != nil {
-			return "", err
-		}
-		req.Header.Set("X-Sync-Key", cfg.Key)
-
-		resp, err := client.Do(req)
-		if err != nil {
-			lastErr = err
-			log.Printf("Attempt %d failed to download %s: %v", i+1, filename, err)
-			continue
-		}
-
-		if resp.StatusCode != http.StatusOK {
-			resp.Body.Close()
-			lastErr = fmt.Errorf("status %d", resp.StatusCode)
-			log.Printf("Attempt %d failed to download %s: status %d", i+1, filename, resp.StatusCode)
-			continue
-		}
-
-		data, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if err != nil {
-			lastErr = err
-			log.Printf("Attempt %d failed to read body for %s: %v", i+1, filename, err)
-			continue
-		}
-		return string(data), nil
-	}
-
-	return "", fmt.Errorf("failed to download %s after %d attempts: %v", filename, maxRetries+1, lastErr)
-}
-
-func checkAndUpload(cfg *Config, client *http.Client) {
-	filenames, err := utils.ListTextFiles(cfg.DirPath)
+func localPaths(cfg *Config) (map[string]string, bool) {
+	paths, err := utils.ListSyncFiles(cfg.DirPath)
 	if err != nil {
 		log.Printf("Error reading directory: %v", err)
-		return
+		return nil, false
 	}
+	return paths, true
+}
 
-	for _, filename := range filenames {
-		contentBytes, err := os.ReadFile(utils.LocalPath(cfg.DirPath, filename))
-		if err != nil {
-			log.Printf("Error reading %s: %v", filename, err)
+func localPathFor(cfg *Config, paths map[string]string, name string) string {
+	if actual, ok := paths[name]; ok {
+		return utils.LocalPath(cfg.DirPath, actual)
+	}
+	return utils.LocalPath(cfg.DirPath, name)
+}
+
+func applyTombstones(cfg *Config, st *syncState, tombstones map[string]protocol.Tombstone, paths map[string]string) {
+	names := make([]string, 0, len(tombstones))
+	for name := range tombstones {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	for _, name := range names {
+		tombstone := tombstones[name]
+		if applied, ok := st.Tombstones[name]; ok && applied >= tombstone.DeletedAt {
 			continue
 		}
-		currentContent := string(contentBytes)
 
-		base, exists := baseContents[filename]
-		if !exists {
-			// New file detected
-			base = ""
+		if _, err := utils.NormalizeSyncPath(name); err != nil {
+			log.Printf("Skipping invalid remote path: %s", name)
+			continue
+		}
+		localPath := localPathFor(cfg, paths, name)
+
+		contentBytes, err := os.ReadFile(localPath)
+		if err != nil && !os.IsNotExist(err) {
+			log.Printf("Error reading %s: %v", name, err)
+			continue
 		}
 
-		if currentContent == base {
-			continue // No change
+		if os.IsNotExist(err) {
+			st.Tombstones[name] = tombstone.DeletedAt
+			continue
 		}
 
-		log.Printf("File changed: %s", filename)
-		syncFile(cfg, client, filename, base, currentContent)
+		base, tracked := st.Base[name]
+		content := string(contentBytes)
+		clean := tracked && content == base
+
+		if tombstone.RenamedTo == "" {
+			if clean {
+				removeLocalFile(cfg, localPath)
+				log.Printf("Removed local file deleted on server: %s", name)
+			} else {
+				log.Printf("Keeping %s: deleted on server but changed locally", name)
+			}
+			delete(st.Base, name)
+			st.Tombstones[name] = tombstone.DeletedAt
+			continue
+		}
+
+		if _, err := utils.NormalizeSyncPath(tombstone.RenamedTo); err != nil {
+			log.Printf("Skipping invalid remote path: %s", tombstone.RenamedTo)
+			st.Tombstones[name] = tombstone.DeletedAt
+			continue
+		}
+		targetPath := localPathFor(cfg, paths, tombstone.RenamedTo)
+
+		_, targetErr := os.Stat(targetPath)
+		switch {
+		case os.IsNotExist(targetErr) && tracked:
+			if err := utils.WriteSyncFile(targetPath, content); err != nil {
+				log.Printf("Error moving %s to %s: %v", name, tombstone.RenamedTo, err)
+				continue
+			}
+			removeLocalFile(cfg, localPath)
+			st.Base[tombstone.RenamedTo] = base
+			delete(st.Base, name)
+			log.Printf("Moved local file %s to %s", name, tombstone.RenamedTo)
+		case targetErr == nil && clean:
+			removeLocalFile(cfg, localPath)
+			delete(st.Base, name)
+			log.Printf("Removed local file %s already present as %s", name, tombstone.RenamedTo)
+		default:
+			log.Printf("Keeping %s: moved to %s on server but changed locally", name, tombstone.RenamedTo)
+			delete(st.Base, name)
+		}
+		st.Tombstones[name] = tombstone.DeletedAt
 	}
 }
 
-func syncFile(cfg *Config, client *http.Client, filename, base, current string) {
-	reqBody := protocol.SyncRequest{
-		Filename: filename,
-		Base:     base,
-		Latest:   current,
-	}
-	jsonBody, _ := json.Marshal(reqBody)
+func pushLocalChanges(cfg *Config, client *http.Client, st *syncState, serverFiles, paths map[string]string) map[string]bool {
+	handled := make(map[string]bool)
 
-	req, err := http.NewRequest("POST", cfg.ServerURL+"/sync", bytes.NewBuffer(jsonBody))
-	if err != nil {
-		log.Printf("Error creating request: %v", err)
-		return
+	names := make([]string, 0, len(paths))
+	for name := range paths {
+		names = append(names, name)
 	}
-	req.Header.Set("X-Sync-Key", cfg.Key)
-	req.Header.Set("Content-Type", "application/json")
+	sort.Strings(names)
 
-	resp, err := client.Do(req)
+	local := make(map[string]string, len(names))
+	for _, name := range names {
+		contentBytes, err := os.ReadFile(localPathFor(cfg, paths, name))
+		if err != nil {
+			log.Printf("Error reading %s: %v", name, err)
+			continue
+		}
+		local[name] = string(contentBytes)
+	}
+
+	removed := make([]string, 0)
+	for name := range st.Base {
+		if _, ok := local[name]; !ok {
+			removed = append(removed, name)
+		}
+	}
+	sort.Strings(removed)
+
+	added := make([]string, 0)
+	for name := range local {
+		if _, ok := st.Base[name]; !ok {
+			added = append(added, name)
+		}
+	}
+	sort.Strings(added)
+
+	claimed := make(map[string]bool)
+	for _, from := range removed {
+		base := st.Base[from]
+		if _, err := os.Stat(localPathFor(cfg, paths, from)); err == nil {
+			continue
+		}
+
+		to := ""
+		for _, candidate := range added {
+			if !claimed[candidate] && local[candidate] == base {
+				to = candidate
+				break
+			}
+		}
+
+		if to != "" {
+			synced, err := renameRemoteFile(cfg, client, from, to, base)
+			if err != nil {
+				log.Printf("Failed to move %s to %s: %v", from, to, err)
+				handled[from] = true
+				continue
+			}
+
+			claimed[to] = true
+			delete(st.Base, from)
+			st.Base[to] = synced
+			handled[from] = true
+			handled[to] = true
+
+			if synced != local[to] {
+				if err := utils.WriteSyncFile(localPathFor(cfg, paths, to), synced); err != nil {
+					log.Printf("Error writing moved file %s: %v", to, err)
+				}
+				local[to] = synced
+			}
+			log.Printf("Moved %s to %s on server", from, to)
+			continue
+		}
+
+		err := deleteRemoteFile(cfg, client, from, base)
+		switch {
+		case err == nil:
+			delete(st.Base, from)
+			handled[from] = true
+			log.Printf("Deleted %s on server", from)
+		case errors.Is(err, errDeleteConflict):
+			delete(st.Base, from)
+			log.Printf("Kept %s on server: it changed after the local deletion", from)
+		default:
+			handled[from] = true
+			log.Printf("Failed to delete %s: %v", from, err)
+		}
+	}
+
+	for _, name := range names {
+		content, ok := local[name]
+		if !ok || handled[name] {
+			continue
+		}
+
+		base, tracked := st.Base[name]
+		if _, onServer := serverFiles[name]; tracked && !onServer {
+			log.Printf("Restoring %s: the server no longer has it", name)
+			base = ""
+			tracked = false
+		}
+
+		if tracked && content == base {
+			continue
+		}
+
+		if !tracked {
+			if hash, ok := serverFiles[name]; ok && hash == utils.CalculateHash(content) {
+				st.Base[name] = content
+				handled[name] = true
+				log.Printf("Adopted identical server copy: %s", name)
+				continue
+			}
+		} else {
+			log.Printf("File changed: %s", name)
+		}
+
+		if uploadAndStore(cfg, client, st, paths, name, base, content) {
+			handled[name] = true
+		}
+	}
+
+	return handled
+}
+
+func uploadAndStore(cfg *Config, client *http.Client, st *syncState, paths map[string]string, filename, base, current string) bool {
+	synced, err := uploadFile(cfg, client, filename, base, current)
+	if errors.Is(err, errUploadConflict) {
+		log.Printf("Postponing upload of %s: it was moved or deleted on the server", filename)
+		return true
+	}
 	if err != nil {
 		log.Printf("Upload failed for %s: %v", filename, err)
-		return
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		log.Printf("Upload failed for %s (status %d): %s", filename, resp.StatusCode, string(body))
-		return
+		return false
 	}
 
-	var syncResp protocol.SyncResponse
-	if err := json.NewDecoder(resp.Body).Decode(&syncResp); err != nil {
-		log.Printf("Error decoding response for %s: %v", filename, err)
-		return
-	}
-
-	// Update local file and base
-	if syncResp.Synced != current {
-		localPath := utils.LocalPath(cfg.DirPath, filename)
-		if err := utils.WriteSyncFile(localPath, syncResp.Synced); err != nil {
+	if synced != current {
+		if err := utils.WriteSyncFile(localPathFor(cfg, paths, filename), synced); err != nil {
 			log.Printf("Error writing merged file %s: %v", filename, err)
-			return
+			return false
 		}
 		log.Printf("File %s updated with merged content.", filename)
 	} else {
 		log.Printf("Upload for %s complete (no merge conflicts).", filename)
 	}
 
-	baseContents[filename] = syncResp.Synced
+	st.Base[filename] = synced
+	return true
+}
+
+func pullFromServer(cfg *Config, client *http.Client, st *syncState, serverFiles, paths map[string]string, handled map[string]bool, force bool) {
+	names := make([]string, 0, len(serverFiles))
+	for name := range serverFiles {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	folded := make(map[string]string, len(names))
+
+	for _, filename := range names {
+		if _, err := utils.NormalizeSyncPath(filename); err != nil {
+			log.Printf("Skipping invalid remote path: %s", filename)
+			continue
+		}
+
+		if cfg.caseInsensitive {
+			fold := strings.ToLower(filename)
+			if other, ok := folded[fold]; ok {
+				log.Printf("Skipping %s: it differs from %s only in letter case, which this device cannot store separately", filename, other)
+				continue
+			}
+			folded[fold] = filename
+		}
+
+		if handled[filename] {
+			continue
+		}
+
+		localPath := localPathFor(cfg, paths, filename)
+
+		base, tracked := st.Base[filename]
+		if !force && tracked && utils.CalculateHash(base) == serverFiles[filename] {
+			continue
+		}
+
+		content, err := downloadFile(cfg, client, filename)
+		if err != nil {
+			log.Printf("Failed to download %s: %v", filename, err)
+			continue
+		}
+
+		if force {
+			if err := utils.WriteSyncFile(localPath, content); err != nil {
+				log.Printf("Error writing forced file %s: %v", filename, err)
+				continue
+			}
+			st.Base[filename] = content
+			log.Printf("Force downloaded file: %s", filename)
+			continue
+		}
+
+		currentBytes, err := os.ReadFile(localPath)
+		switch {
+		case os.IsNotExist(err):
+			if err := utils.WriteSyncFile(localPath, content); err != nil {
+				log.Printf("Error writing new file %s: %v", filename, err)
+				continue
+			}
+			st.Base[filename] = content
+			log.Printf("Downloaded new file: %s", filename)
+		case err != nil:
+			log.Printf("Error reading %s: %v", filename, err)
+		case string(currentBytes) == content:
+			st.Base[filename] = content
+		case tracked && string(currentBytes) == base:
+			if err := utils.WriteSyncFile(localPath, content); err != nil {
+				log.Printf("Error writing file %s: %v", filename, err)
+				continue
+			}
+			st.Base[filename] = content
+			log.Printf("Updated file from server: %s", filename)
+		default:
+			log.Printf("Skipping download for %s (local changes detected). Will attempt merge via upload.", filename)
+		}
+	}
+}
+
+func removeLocalFile(cfg *Config, localPath string) {
+	if err := os.Remove(localPath); err != nil && !os.IsNotExist(err) {
+		log.Printf("Error removing %s: %v", localPath, err)
+		return
+	}
+	utils.PruneEmptyDirs(cfg.DirPath, localPath)
 }

@@ -7,14 +7,20 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"golang.org/x/text/unicode/norm"
 )
 
 // ErrInvalidPath is returned when a sync path is not a safe relative path.
 var ErrInvalidPath = errors.New("invalid sync path")
 
+func CanonicalSyncName(name string) string {
+	return norm.NFC.String(strings.ReplaceAll(name, `\`, "/"))
+}
+
 // NormalizeSyncPath validates name and returns it as a slash-separated relative path.
 func NormalizeSyncPath(name string) (string, error) {
-	rel := strings.ReplaceAll(name, `\`, "/")
+	rel := CanonicalSyncName(name)
 	if rel == "" || !strings.HasSuffix(rel, ".txt") {
 		return "", ErrInvalidPath
 	}
@@ -46,10 +52,76 @@ func ResolveSyncPath(root, name string) (string, error) {
 
 // WriteSyncFile writes content, creating parent directories when needed.
 func WriteSyncFile(localPath, content string) error {
-	if err := os.MkdirAll(filepath.Dir(localPath), 0755); err != nil {
+	dir := filepath.Dir(localPath)
+	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
 	}
-	return os.WriteFile(localPath, []byte(content), 0644)
+
+	tmp, err := os.CreateTemp(dir, ".hsync-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+
+	if _, err := tmp.WriteString(content); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	if err := os.Chmod(tmpName, 0644); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	if err := os.Rename(tmpName, localPath); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	return nil
+}
+
+func IsCaseInsensitiveDir(dir string) bool {
+	probe, err := os.CreateTemp(dir, "hsync-case-*.tmp")
+	if err != nil {
+		return false
+	}
+	name := probe.Name()
+	probe.Close()
+	defer os.Remove(name)
+
+	upper := filepath.Join(filepath.Dir(name), strings.ToUpper(filepath.Base(name)))
+	if upper == name {
+		return false
+	}
+
+	_, err = os.Stat(upper)
+	return err == nil
+}
+
+func PruneEmptyDirs(root, localPath string) {
+	absRoot, err := filepath.Abs(root)
+	if err != nil {
+		return
+	}
+
+	dir, err := filepath.Abs(filepath.Dir(localPath))
+	if err != nil {
+		return
+	}
+
+	for dir != absRoot && strings.HasPrefix(dir, absRoot+string(filepath.Separator)) {
+		entries, err := os.ReadDir(dir)
+		if err != nil || len(entries) > 0 {
+			return
+		}
+		if err := os.Remove(dir); err != nil {
+			return
+		}
+		dir = filepath.Dir(dir)
+	}
 }
 
 // ListTextFiles walks root recursively and returns slash-separated relative paths of .txt files.
@@ -79,5 +151,22 @@ func ListTextFiles(root string) ([]string, error) {
 	}
 
 	sort.Strings(files)
+	return files, nil
+}
+
+func ListSyncFiles(root string) (map[string]string, error) {
+	names, err := ListTextFiles(root)
+	if err != nil {
+		return nil, err
+	}
+
+	files := make(map[string]string, len(names))
+	for _, name := range names {
+		canonical := CanonicalSyncName(name)
+		if existing, ok := files[canonical]; ok && existing == canonical {
+			continue
+		}
+		files[canonical] = name
+	}
 	return files, nil
 }
