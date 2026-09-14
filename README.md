@@ -16,7 +16,7 @@ It consists of a central server and client software that communicate via HTTP to
 
 ### Prerequisites
 
-- [Go](https://go.dev/) 1.25.3 or higher.
+- [Go](https://go.dev/) 1.27.1 or higher.
 
 ### Build
 
