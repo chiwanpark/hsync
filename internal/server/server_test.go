@@ -3,414 +3,311 @@ package server
 import (
 	"bytes"
 	"encoding/json"
-	"fmt"
 	"hsync/internal/protocol"
 	"hsync/internal/utils"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
-func newTestServer(t *testing.T) (*httptest.Server, string) {
+func newTestServer(t *testing.T, seed map[string]string) (*httptest.Server, string) {
 	t.Helper()
 
 	dataDir := t.TempDir()
-	handler, err := NewHandler(dataDir, "test-key")
-	if err != nil {
-		t.Fatalf("NewHandler returned error: %v", err)
+	for name, content := range seed {
+		writeFile(t, dataDir, name, content)
 	}
+	return serve(t, dataDir), dataDir
+}
+
+func serve(t *testing.T, dataDir string) *httptest.Server {
+	t.Helper()
+
+	handler, err := NewHandler(dataDir, "test-key")
+	require.NoError(t, err)
 
 	ts := httptest.NewServer(handler)
 	t.Cleanup(ts.Close)
-	return ts, dataDir
+	return ts
 }
 
-func do(t *testing.T, ts *httptest.Server, method, path string, body string) *http.Response {
+func writeFile(t *testing.T, root, name, content string) {
+	t.Helper()
+	require.NoError(t, utils.WriteFile(utils.LocalPath(root, name), content))
+}
+
+func do(t *testing.T, ts *httptest.Server, method, path string, body io.Reader) *http.Response {
 	t.Helper()
 
-	var reader *bytes.Reader
-	if body == "" {
-		reader = bytes.NewReader(nil)
-	} else {
-		reader = bytes.NewReader([]byte(body))
-	}
-
-	req, err := http.NewRequest(method, ts.URL+path, reader)
-	if err != nil {
-		t.Fatalf("NewRequest returned error: %v", err)
-	}
+	req, err := http.NewRequest(method, ts.URL+path, body)
+	require.NoError(t, err)
 	req.Header.Set("X-Sync-Key", "test-key")
 
 	resp, err := ts.Client().Do(req)
-	if err != nil {
-		t.Fatalf("request %s %s returned error: %v", method, path, err)
-	}
-	t.Cleanup(func() { resp.Body.Close() })
+	require.NoError(t, err)
 	return resp
 }
 
-func writeFile(t *testing.T, dataDir, name, content string) {
-	t.Helper()
-	if err := utils.WriteSyncFile(utils.LocalPath(dataDir, name), content); err != nil {
-		t.Fatalf("WriteSyncFile returned error: %v", err)
-	}
-}
-
-func deleteQuery(name, base string) string {
-	return "/sync?" + url.Values{"filename": {name}, "base": {utils.CalculateHash(base)}}.Encode()
-}
-
-func tombstones(t *testing.T, ts *httptest.Server) map[string]protocol.Tombstone {
+func index(t *testing.T, ts *httptest.Server) protocol.IndexResponse {
 	t.Helper()
 
-	resp := do(t, ts, http.MethodGet, "/deleted", "")
+	resp := do(t, ts, http.MethodGet, "/index", nil)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	var parsed protocol.IndexResponse
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&parsed))
+	return parsed
+}
+
+func push(t *testing.T, ts *httptest.Server, req protocol.PushRequest) (protocol.PushResponse, int) {
+	t.Helper()
+
+	body, err := json.Marshal(req)
+	require.NoError(t, err)
+
+	resp := do(t, ts, http.MethodPost, "/push", bytes.NewReader(body))
+	defer resp.Body.Close()
+
 	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("GET /deleted status = %d, want 200", resp.StatusCode)
+		return protocol.PushResponse{}, resp.StatusCode
 	}
 
-	out := make(map[string]protocol.Tombstone)
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		t.Fatalf("decode returned error: %v", err)
-	}
-	return out
+	var parsed protocol.PushResponse
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&parsed))
+	return parsed, resp.StatusCode
 }
 
-func TestDeleteRemovesNestedFileAndRecordsTombstone(t *testing.T) {
-	ts, dataDir := newTestServer(t)
-	writeFile(t, dataDir, "projects/alpha/nested.txt", "Nested")
-
-	resp := do(t, ts, http.MethodDelete, deleteQuery("projects/alpha/nested.txt", "Nested"), "")
-	if resp.StatusCode != http.StatusNoContent {
-		t.Fatalf("DELETE status = %d, want 204", resp.StatusCode)
+func blobs(contents ...string) map[string]string {
+	result := make(map[string]string, len(contents))
+	for _, content := range contents {
+		result[utils.CalculateHash(content)] = content
 	}
-
-	if _, err := os.Stat(utils.LocalPath(dataDir, "projects/alpha/nested.txt")); !os.IsNotExist(err) {
-		t.Error("file still exists after delete")
-	}
-	if _, err := os.Stat(utils.LocalPath(dataDir, "projects")); !os.IsNotExist(err) {
-		t.Error("empty parent directories were not pruned")
-	}
-
-	entry, ok := tombstones(t, ts)["projects/alpha/nested.txt"]
-	if !ok {
-		t.Fatal("tombstone was not recorded")
-	}
-	if entry.RenamedTo != "" {
-		t.Errorf("RenamedTo = %q, want empty", entry.RenamedTo)
-	}
+	return result
 }
 
-func TestDeleteRejectsStaleBase(t *testing.T) {
-	ts, dataDir := newTestServer(t)
-	writeFile(t, dataDir, "note.txt", "Changed on server")
+func TestIndexListsWorkingTreeNotes(t *testing.T) {
+	ts, _ := newTestServer(t, map[string]string{
+		"note.txt":                "Note\n",
+		"projects/alpha/deep.txt": "Deep\n",
+	})
 
-	resp := do(t, ts, http.MethodDelete, deleteQuery("note.txt", "Old content"), "")
-	if resp.StatusCode != http.StatusConflict {
-		t.Fatalf("DELETE status = %d, want 409", resp.StatusCode)
-	}
-	if _, err := os.Stat(utils.LocalPath(dataDir, "note.txt")); err != nil {
-		t.Errorf("file was removed despite the stale base: %v", err)
-	}
+	parsed := index(t, ts)
+	assert.NotEmpty(t, parsed.Root)
+	assert.NotEqual(t, parsed.Root, parsed.Commit, "head should have advanced past the root commit")
+	assert.Equal(t, map[string]string{
+		"note.txt":                utils.CalculateHash("Note\n"),
+		"projects/alpha/deep.txt": utils.CalculateHash("Deep\n"),
+	}, parsed.Files)
 }
 
-func TestDeleteRejectsTraversal(t *testing.T) {
-	ts, _ := newTestServer(t)
+func TestPushRejections(t *testing.T) {
+	ts, dataDir := newTestServer(t, nil)
+	head := index(t, ts).Commit
+	noteHash := utils.CalculateHash("Note\n")
 
-	resp := do(t, ts, http.MethodDelete, "/sync?filename=..%2Fescape.txt", "")
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("DELETE status = %d, want 400", resp.StatusCode)
+	cases := []struct {
+		name    string
+		request protocol.PushRequest
+		want    int
+	}{
+		{
+			name:    "without a parent",
+			request: protocol.PushRequest{Files: map[string]string{"note.txt": noteHash}, Blobs: blobs("Note\n")},
+			want:    http.StatusBadRequest,
+		},
+		{
+			name:    "with an unknown parent",
+			request: protocol.PushRequest{Parent: utils.CalculateHash("nope"), Files: map[string]string{"note.txt": noteHash}, Blobs: blobs("Note\n")},
+			want:    http.StatusConflict,
+		},
+		{
+			name:    "without the note content",
+			request: protocol.PushRequest{Parent: head, Files: map[string]string{"note.txt": utils.CalculateHash("Never uploaded\n")}},
+			want:    http.StatusUnprocessableEntity,
+		},
+		{
+			name:    "with content that does not match its hash",
+			request: protocol.PushRequest{Parent: head, Files: map[string]string{"note.txt": noteHash}, Blobs: map[string]string{noteHash: "Different\n"}},
+			want:    http.StatusBadRequest,
+		},
+		{
+			name:    "with a traversal path",
+			request: protocol.PushRequest{Parent: head, Files: map[string]string{"../escape.txt": utils.CalculateHash("Escaped\n")}, Blobs: blobs("Escaped\n")},
+			want:    http.StatusBadRequest,
+		},
 	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, status := push(t, ts, tc.request)
+			assert.Equal(t, tc.want, status)
+		})
+	}
+
+	assert.NoFileExists(t, filepath.Join(dataDir, "..", "escape.txt"))
 }
 
-func TestRenameMovesFileAndRecordsTombstone(t *testing.T) {
-	ts, dataDir := newTestServer(t)
-	writeFile(t, dataDir, "note.txt", "Note")
+func TestPushWritesWorkingTree(t *testing.T) {
+	ts, dataDir := newTestServer(t, nil)
+	start := index(t, ts)
 
-	body, err := json.Marshal(protocol.RenameRequest{From: "note.txt", To: "projects/note.txt", Base: "Note"})
-	if err != nil {
-		t.Fatalf("Marshal returned error: %v", err)
-	}
-
-	resp := do(t, ts, http.MethodPost, "/rename", string(body))
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("POST /rename status = %d, want 200", resp.StatusCode)
-	}
-
-	var syncResp protocol.SyncResponse
-	if err := json.NewDecoder(resp.Body).Decode(&syncResp); err != nil {
-		t.Fatalf("decode returned error: %v", err)
-	}
-	if syncResp.Synced != "Note" {
-		t.Errorf("Synced = %q, want %q", syncResp.Synced, "Note")
-	}
-
-	if _, err := os.Stat(utils.LocalPath(dataDir, "note.txt")); !os.IsNotExist(err) {
-		t.Error("source file still exists after rename")
-	}
-	data, err := os.ReadFile(utils.LocalPath(dataDir, "projects/note.txt"))
-	if err != nil {
-		t.Fatalf("ReadFile returned error: %v", err)
-	}
-	if string(data) != "Note" {
-		t.Errorf("target content = %q, want %q", string(data), "Note")
-	}
-
-	entry, ok := tombstones(t, ts)["note.txt"]
-	if !ok {
-		t.Fatal("tombstone was not recorded")
-	}
-	if entry.RenamedTo != "projects/note.txt" {
-		t.Errorf("RenamedTo = %q, want %q", entry.RenamedTo, "projects/note.txt")
-	}
+	result, status := push(t, ts, protocol.PushRequest{
+		Parent: start.Commit,
+		Files: map[string]string{
+			"note.txt":        utils.CalculateHash("Note\n"),
+			"projects/深い.txt": utils.CalculateHash("Nested\n"),
+		},
+		Blobs: blobs("Note\n", "Nested\n"),
+	})
+	require.Equal(t, http.StatusOK, status)
+	assert.NotEqual(t, start.Commit, result.Commit, "push should create a commit")
+	assert.FileExists(t, utils.LocalPath(dataDir, "projects/深い.txt"))
 }
 
-func TestRenameKeepsExistingTarget(t *testing.T) {
-	ts, dataDir := newTestServer(t)
-	writeFile(t, dataDir, "note.txt", "Source")
-	writeFile(t, dataDir, "projects/note.txt", "Target already merged")
+func TestPushFromStaleParentKeepsBothChanges(t *testing.T) {
+	ts, dataDir := newTestServer(t, map[string]string{"a.txt": "A\n"})
+	start := index(t, ts)
 
-	body, err := json.Marshal(protocol.RenameRequest{From: "note.txt", To: "projects/note.txt", Base: "Source"})
-	if err != nil {
-		t.Fatalf("Marshal returned error: %v", err)
-	}
+	_, status := push(t, ts, protocol.PushRequest{
+		Parent: start.Commit,
+		Files:  map[string]string{"a.txt": start.Files["a.txt"], "b.txt": utils.CalculateHash("B\n")},
+		Blobs:  blobs("B\n"),
+	})
+	require.Equal(t, http.StatusOK, status)
 
-	resp := do(t, ts, http.MethodPost, "/rename", string(body))
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("POST /rename status = %d, want 200", resp.StatusCode)
-	}
+	result, status := push(t, ts, protocol.PushRequest{
+		Parent: start.Commit,
+		Files:  map[string]string{"a.txt": start.Files["a.txt"], "c.txt": utils.CalculateHash("C\n")},
+		Blobs:  blobs("C\n"),
+	})
+	require.Equal(t, http.StatusOK, status)
 
-	data, err := os.ReadFile(utils.LocalPath(dataDir, "projects/note.txt"))
-	if err != nil {
-		t.Fatalf("ReadFile returned error: %v", err)
-	}
-	if string(data) != "Target already merged" {
-		t.Errorf("target content = %q, want %q", string(data), "Target already merged")
-	}
-	if _, err := os.Stat(utils.LocalPath(dataDir, "note.txt")); !os.IsNotExist(err) {
-		t.Error("source file still exists after rename")
+	for _, name := range []string{"a.txt", "b.txt", "c.txt"} {
+		assert.Contains(t, result.Files, name)
+		assert.FileExists(t, utils.LocalPath(dataDir, name))
 	}
 }
 
-func TestRenameRejectsInvalidPaths(t *testing.T) {
-	ts, _ := newTestServer(t)
+func TestPushWithoutChangesKeepsHead(t *testing.T) {
+	ts, _ := newTestServer(t, map[string]string{"a.txt": "A\n"})
+	start := index(t, ts)
 
-	bodies := []string{
-		`{"from":"../escape.txt","to":"note.txt"}`,
-		`{"from":"note.txt","to":"../escape.txt"}`,
-		`{"from":"note.txt","to":"note.txt"}`,
-		`{"from":"note.md","to":"note.txt"}`,
-	}
-	for _, body := range bodies {
-		resp := do(t, ts, http.MethodPost, "/rename", body)
-		if resp.StatusCode != http.StatusBadRequest {
-			t.Errorf("POST /rename %s status = %d, want 400", body, resp.StatusCode)
-		}
-	}
+	result, status := push(t, ts, protocol.PushRequest{Parent: start.Commit, Files: start.Files})
+	require.Equal(t, http.StatusOK, status)
+	assert.Equal(t, start.Commit, result.Commit)
 }
 
-func TestUploadClearsTombstone(t *testing.T) {
-	ts, dataDir := newTestServer(t)
-	writeFile(t, dataDir, "note.txt", "Note")
+func TestBlobIsServedByHash(t *testing.T) {
+	ts, _ := newTestServer(t, map[string]string{"a.txt": "A\n"})
+	parsed := index(t, ts)
 
-	do(t, ts, http.MethodDelete, deleteQuery("note.txt", "Note"), "")
-	if _, ok := tombstones(t, ts)["note.txt"]; !ok {
-		t.Fatal("tombstone was not recorded")
-	}
+	resp := do(t, ts, http.MethodGet, "/blob?"+url.Values{"hash": {parsed.Files["a.txt"]}}.Encode(), nil)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
 
-	body, err := json.Marshal(protocol.SyncRequest{Filename: "note.txt", Base: "", Latest: "Recreated"})
-	if err != nil {
-		t.Fatalf("Marshal returned error: %v", err)
-	}
-	resp := do(t, ts, http.MethodPost, "/sync", string(body))
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("POST /sync status = %d, want 200", resp.StatusCode)
-	}
-
-	if _, ok := tombstones(t, ts)["note.txt"]; ok {
-		t.Error("tombstone survived a re-upload")
-	}
+	content, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	assert.Equal(t, "A\n", string(content))
 }
 
-func TestTombstonesSurviveRestart(t *testing.T) {
+func TestUnknownBlobIsNotFound(t *testing.T) {
+	ts, _ := newTestServer(t, nil)
+
+	resp := do(t, ts, http.MethodGet, "/blob?hash="+utils.CalculateHash("missing"), nil)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusNotFound, resp.StatusCode)
+}
+
+func TestHistorySurvivesRestart(t *testing.T) {
 	dataDir := t.TempDir()
-	writeFile(t, dataDir, "note.txt", "Note")
+	writeFile(t, dataDir, "a.txt", "A\n")
 
-	handler, err := NewHandler(dataDir, "test-key")
-	if err != nil {
-		t.Fatalf("NewHandler returned error: %v", err)
-	}
-	first := httptest.NewServer(handler)
-	do(t, first, http.MethodDelete, deleteQuery("note.txt", "Note"), "")
-	first.Close()
+	start := index(t, serve(t, dataDir))
+	restarted := serve(t, dataDir)
+	assert.Equal(t, start.Commit, index(t, restarted).Commit)
 
-	restarted, err := NewHandler(dataDir, "test-key")
-	if err != nil {
-		t.Fatalf("NewHandler returned error: %v", err)
-	}
-	second := httptest.NewServer(restarted)
-	t.Cleanup(second.Close)
-
-	if _, ok := tombstones(t, second)["note.txt"]; !ok {
-		t.Error("tombstone was lost across a restart")
-	}
+	result, status := push(t, restarted, protocol.PushRequest{
+		Parent: start.Commit,
+		Files:  map[string]string{"a.txt": start.Files["a.txt"], "b.txt": utils.CalculateHash("B\n")},
+		Blobs:  blobs("B\n"),
+	})
+	require.Equal(t, http.StatusOK, status)
+	assert.Contains(t, result.Files, "b.txt", "an old commit must stay usable as a parent")
 }
 
-func TestTombstoneFileIsNotListedAsNote(t *testing.T) {
-	ts, dataDir := newTestServer(t)
-	writeFile(t, dataDir, "note.txt", "Note")
-	do(t, ts, http.MethodDelete, deleteQuery("note.txt", "Note"), "")
+func TestMetadataIsNotListedAsNote(t *testing.T) {
+	ts, dataDir := newTestServer(t, map[string]string{"a.txt": "A\n"})
 
-	resp := do(t, ts, http.MethodGet, "/sync", "")
-	files := make(map[string]string)
-	if err := json.NewDecoder(resp.Body).Decode(&files); err != nil {
-		t.Fatalf("decode returned error: %v", err)
-	}
-	for name := range files {
-		if strings.HasPrefix(name, ".hsync") {
-			t.Errorf("internal file %q was listed as a note", name)
-		}
-	}
+	assert.Len(t, index(t, ts).Files, 1)
+
+	notes, err := utils.ListNotes(dataDir)
+	require.NoError(t, err)
+	assert.Equal(t, map[string]string{"a.txt": "a.txt"}, notes)
 }
 
 func TestUnauthorizedRequestsAreRejected(t *testing.T) {
-	ts, _ := newTestServer(t)
+	ts, _ := newTestServer(t, nil)
 
-	for _, path := range []string{"/sync", "/deleted", "/rename"} {
-		req, err := http.NewRequest(http.MethodGet, ts.URL+path, nil)
-		if err != nil {
-			t.Fatalf("NewRequest returned error: %v", err)
-		}
+	for method, path := range map[string]string{http.MethodGet: "/index", http.MethodPost: "/push"} {
+		req, err := http.NewRequest(method, ts.URL+path, strings.NewReader("{}"))
+		require.NoError(t, err)
+
 		resp, err := ts.Client().Do(req)
-		if err != nil {
-			t.Fatalf("request returned error: %v", err)
-		}
+		require.NoError(t, err)
 		resp.Body.Close()
-		if resp.StatusCode != http.StatusUnauthorized {
-			t.Errorf("%s status = %d, want 401", path, resp.StatusCode)
-		}
+
+		assert.Equal(t, http.StatusUnauthorized, resp.StatusCode, path)
 	}
 }
 
-func TestUploadToRenamedPathIsRejected(t *testing.T) {
-	ts, dataDir := newTestServer(t)
-	writeFile(t, dataDir, "X.txt", "Line one\n")
+func TestDoubledSlashKeepsTheMethod(t *testing.T) {
+	ts, dataDir := newTestServer(t, nil)
 
-	renameBody, err := json.Marshal(protocol.RenameRequest{From: "X.txt", To: "Y.txt", Base: "Line one\n"})
-	if err != nil {
-		t.Fatalf("Marshal returned error: %v", err)
-	}
-	do(t, ts, http.MethodPost, "/rename", string(renameBody))
-
-	uploadBody, err := json.Marshal(protocol.SyncRequest{
-		Filename: "X.txt",
-		Base:     "Line one\n",
-		Latest:   "Line one\nLine two\n",
+	body, err := json.Marshal(protocol.PushRequest{
+		Parent: index(t, ts).Commit,
+		Files:  map[string]string{"a.txt": utils.CalculateHash("A\n")},
+		Blobs:  blobs("A\n"),
 	})
-	if err != nil {
-		t.Fatalf("Marshal returned error: %v", err)
-	}
+	require.NoError(t, err)
 
-	resp := do(t, ts, http.MethodPost, "/sync", string(uploadBody))
-	if resp.StatusCode != http.StatusConflict {
-		t.Fatalf("POST /sync status = %d, want 409", resp.StatusCode)
-	}
-	if _, err := os.Stat(utils.LocalPath(dataDir, "X.txt")); !os.IsNotExist(err) {
-		t.Error("the renamed away path was recreated")
-	}
+	resp := do(t, ts, http.MethodPost, "//push", bytes.NewReader(body))
+	defer resp.Body.Close()
+
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.FileExists(t, utils.LocalPath(dataDir, "a.txt"))
 }
 
-func TestUploadRecreatesDeletedFile(t *testing.T) {
-	ts, dataDir := newTestServer(t)
-	writeFile(t, dataDir, "X.txt", "Note")
-	do(t, ts, http.MethodDelete, deleteQuery("X.txt", "Note"), "")
-
-	body, err := json.Marshal(protocol.SyncRequest{Filename: "X.txt", Base: "", Latest: "Recreated"})
-	if err != nil {
-		t.Fatalf("Marshal returned error: %v", err)
-	}
-
-	resp := do(t, ts, http.MethodPost, "/sync", string(body))
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("POST /sync status = %d, want 200", resp.StatusCode)
-	}
-	if _, err := os.Stat(utils.LocalPath(dataDir, "X.txt")); err != nil {
-		t.Errorf("file was not recreated: %v", err)
-	}
-}
-
-func TestRenameFollowsAnEarlierRename(t *testing.T) {
-	ts, dataDir := newTestServer(t)
-	writeFile(t, dataDir, "X.txt", "Shared")
-
-	first, err := json.Marshal(protocol.RenameRequest{From: "X.txt", To: "alpha/X.txt", Base: "Shared"})
-	if err != nil {
-		t.Fatalf("Marshal returned error: %v", err)
-	}
-	do(t, ts, http.MethodPost, "/rename", string(first))
-
-	second, err := json.Marshal(protocol.RenameRequest{From: "X.txt", To: "beta/X.txt", Base: "Shared"})
-	if err != nil {
-		t.Fatalf("Marshal returned error: %v", err)
-	}
-	resp := do(t, ts, http.MethodPost, "/rename", string(second))
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("POST /rename status = %d, want 200", resp.StatusCode)
-	}
-
-	if _, err := os.Stat(utils.LocalPath(dataDir, "alpha/X.txt")); !os.IsNotExist(err) {
-		t.Error("the intermediate path still holds a copy")
-	}
-	data, err := os.ReadFile(utils.LocalPath(dataDir, "beta/X.txt"))
-	if err != nil {
-		t.Fatalf("ReadFile returned error: %v", err)
-	}
-	if string(data) != "Shared" {
-		t.Errorf("content = %q, want %q", string(data), "Shared")
-	}
-
-	entries := tombstones(t, ts)
-	if entries["X.txt"].RenamedTo != "beta/X.txt" {
-		t.Errorf("X.txt tombstone = %q, want beta/X.txt", entries["X.txt"].RenamedTo)
-	}
-	if entries["alpha/X.txt"].RenamedTo != "beta/X.txt" {
-		t.Errorf("alpha/X.txt tombstone = %q, want beta/X.txt", entries["alpha/X.txt"].RenamedTo)
-	}
-}
-
-func TestConcurrentRequestsAreSerialized(t *testing.T) {
-	ts, dataDir := newTestServer(t)
-	writeFile(t, dataDir, "shared.txt", "Base\n")
+func TestConcurrentPushesAreSerialized(t *testing.T) {
+	ts, _ := newTestServer(t, nil)
+	start := index(t, ts)
 
 	var wg sync.WaitGroup
 	for i := 0; i < 8; i++ {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			body, err := json.Marshal(protocol.SyncRequest{
-				Filename: fmt.Sprintf("note%d.txt", i),
-				Base:     "",
-				Latest:   fmt.Sprintf("content %d\n", i),
+
+			name := string(rune('a'+i)) + ".txt"
+			content := string(rune('a'+i)) + "\n"
+
+			_, status := push(t, ts, protocol.PushRequest{
+				Parent: start.Commit,
+				Files:  map[string]string{name: utils.CalculateHash(content)},
+				Blobs:  blobs(content),
 			})
-			if err != nil {
-				t.Errorf("Marshal returned error: %v", err)
-				return
-			}
-			do(t, ts, http.MethodPost, "/sync", string(body))
-			do(t, ts, http.MethodGet, "/sync", "")
-			do(t, ts, http.MethodGet, "/deleted", "")
+			assert.Equal(t, http.StatusOK, status)
 		}(i)
 	}
 	wg.Wait()
 
-	names, err := utils.ListTextFiles(dataDir)
-	if err != nil {
-		t.Fatalf("ListTextFiles returned error: %v", err)
-	}
-	if len(names) != 9 {
-		t.Errorf("server holds %d notes, want 9: %v", len(names), names)
-	}
+	assert.Len(t, index(t, ts).Files, 8)
 }

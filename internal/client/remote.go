@@ -3,229 +3,128 @@ package client
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hsync/internal/protocol"
-	"hsync/internal/utils"
 	"io"
-	"log"
 	"net/http"
 	"net/url"
-	"time"
+	"strings"
 )
 
-func newRequest(cfg *Config, method, path, query string, body io.Reader) (*http.Request, error) {
-	target := cfg.ServerURL + path
-	if query != "" {
-		target += "?" + query
-	}
+var (
+	errUnknownParent = errors.New("the server does not know the parent commit")
+	errMissingBlob   = errors.New("the server is missing an uploaded note")
+)
 
-	req, err := http.NewRequest(method, target, body)
-	if err != nil {
-		return nil, err
+func normalizeServerURL(raw string) (string, error) {
+	trimmed := strings.TrimRight(strings.TrimSpace(raw), "/")
+
+	parsed, err := url.Parse(trimmed)
+	switch {
+	case err != nil:
+		return "", err
+	case parsed.Scheme != "http" && parsed.Scheme != "https":
+		return "", fmt.Errorf("expected an http or https URL, got %q", raw)
+	case parsed.Host == "":
+		return "", fmt.Errorf("missing host in %q", raw)
+	case parsed.RawQuery != "" || parsed.Fragment != "":
+		return "", fmt.Errorf("expected a plain URL without a query or fragment, got %q", raw)
 	}
-	req.Header.Set("X-Sync-Key", cfg.Key)
-	return req, nil
+	return trimmed, nil
 }
 
-func fetchFileList(cfg *Config, client *http.Client) (map[string]string, error) {
-	req, err := newRequest(cfg, http.MethodGet, "/sync", "", nil)
-	if err != nil {
-		return nil, err
-	}
+func fetchIndex(cfg *Config, client *http.Client) (protocol.IndexResponse, error) {
+	var index protocol.IndexResponse
 
-	resp, err := client.Do(req)
+	resp, err := send(cfg, client, http.MethodGet, "/index", nil)
 	if err != nil {
-		return nil, err
+		return index, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("status %d", resp.StatusCode)
+		return index, describe(resp.StatusCode)
 	}
-
-	files := make(map[string]string)
-	if err := json.NewDecoder(resp.Body).Decode(&files); err != nil {
-		return nil, err
+	if err := json.NewDecoder(resp.Body).Decode(&index); err != nil {
+		return index, err
 	}
-	return files, nil
+	if index.Files == nil {
+		index.Files = map[string]string{}
+	}
+	return index, nil
 }
 
-func fetchTombstones(cfg *Config, client *http.Client) (map[string]protocol.Tombstone, error) {
-	req, err := newRequest(cfg, http.MethodGet, "/deleted", "", nil)
-	if err != nil {
-		return nil, err
-	}
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusNotFound {
-		return map[string]protocol.Tombstone{}, nil
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("status %d", resp.StatusCode)
-	}
-
-	tombstones := make(map[string]protocol.Tombstone)
-	if err := json.NewDecoder(resp.Body).Decode(&tombstones); err != nil {
-		return nil, err
-	}
-	return tombstones, nil
-}
-
-const maxDownloadBackoff = 8 * time.Second
-
-var errNotFound = fmt.Errorf("not found on the server")
-
-func downloadFile(cfg *Config, client *http.Client, filename string) (string, error) {
-	var lastErr error
-	maxRetries := 10
-	backoff := 500 * time.Millisecond
-
-	for i := 0; i <= maxRetries; i++ {
-		if i > 0 {
-			time.Sleep(backoff)
-			if backoff < maxDownloadBackoff {
-				backoff *= 2
-			}
-		}
-
-		query := url.Values{"filename": {filename}}.Encode()
-		req, err := newRequest(cfg, http.MethodGet, "/sync", query, nil)
-		if err != nil {
-			return "", err
-		}
-
-		resp, err := client.Do(req)
-		if err != nil {
-			lastErr = err
-			log.Printf("Attempt %d failed to download %s: %v", i+1, filename, err)
-			continue
-		}
-
-		if resp.StatusCode == http.StatusNotFound {
-			resp.Body.Close()
-			return "", errNotFound
-		}
-
-		if resp.StatusCode != http.StatusOK {
-			resp.Body.Close()
-			lastErr = fmt.Errorf("status %d", resp.StatusCode)
-			log.Printf("Attempt %d failed to download %s: status %d", i+1, filename, resp.StatusCode)
-			continue
-		}
-
-		data, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if err != nil {
-			lastErr = err
-			log.Printf("Attempt %d failed to read body for %s: %v", i+1, filename, err)
-			continue
-		}
-		return string(data), nil
-	}
-
-	return "", fmt.Errorf("failed to download %s after %d attempts: %v", filename, maxRetries+1, lastErr)
-}
-
-var errUploadConflict = fmt.Errorf("file was moved or deleted on the server")
-
-func uploadFile(cfg *Config, client *http.Client, filename, base, current string) (string, error) {
-	jsonBody, err := json.Marshal(protocol.SyncRequest{
-		Filename: filename,
-		Base:     base,
-		Latest:   current,
-	})
-	if err != nil {
-		return "", err
-	}
-
-	req, err := newRequest(cfg, http.MethodPost, "/sync", "", bytes.NewBuffer(jsonBody))
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := client.Do(req)
+func fetchBlob(cfg *Config, client *http.Client, hash string) (string, error) {
+	resp, err := send(cfg, client, http.MethodGet, "/blob?"+url.Values{"hash": {hash}}.Encode(), nil)
 	if err != nil {
 		return "", err
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode == http.StatusConflict {
-		return "", errUploadConflict
-	}
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("status %d: %s", resp.StatusCode, string(body))
+		return "", describe(resp.StatusCode)
 	}
 
-	var syncResp protocol.SyncResponse
-	if err := json.NewDecoder(resp.Body).Decode(&syncResp); err != nil {
-		return "", err
-	}
-	return syncResp.Synced, nil
+	content, err := io.ReadAll(resp.Body)
+	return string(content), err
 }
 
-var errDeleteConflict = fmt.Errorf("server copy changed")
+func pushCommit(cfg *Config, client *http.Client, parent string, files, blobs map[string]string) (protocol.PushResponse, error) {
+	var result protocol.PushResponse
 
-func deleteRemoteFile(cfg *Config, client *http.Client, filename, base string) error {
-	query := url.Values{
-		"filename": {filename},
-		"base":     {utils.CalculateHash(base)},
-	}.Encode()
-
-	req, err := newRequest(cfg, http.MethodDelete, "/sync", query, nil)
+	body, err := json.Marshal(protocol.PushRequest{Parent: parent, Files: files, Blobs: blobs})
 	if err != nil {
-		return err
+		return result, err
 	}
 
-	resp, err := client.Do(req)
+	resp, err := send(cfg, client, http.MethodPost, "/push", bytes.NewReader(body))
 	if err != nil {
-		return err
+		return result, err
 	}
 	defer resp.Body.Close()
 
 	switch resp.StatusCode {
-	case http.StatusNoContent, http.StatusOK:
-		return nil
+	case http.StatusOK:
 	case http.StatusConflict:
-		return errDeleteConflict
+		return result, errUnknownParent
+	case http.StatusUnprocessableEntity:
+		return result, errMissingBlob
 	default:
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("status %d: %s", resp.StatusCode, string(body))
+		return result, describe(resp.StatusCode)
 	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return result, err
+	}
+	if result.Files == nil {
+		result.Files = map[string]string{}
+	}
+	return result, nil
 }
 
-func renameRemoteFile(cfg *Config, client *http.Client, from, to, base string) (string, error) {
-	jsonBody, err := json.Marshal(protocol.RenameRequest{From: from, To: to, Base: base})
+func send(cfg *Config, client *http.Client, method, path string, body io.Reader) (*http.Response, error) {
+	req, err := http.NewRequest(method, cfg.ServerURL+path, body)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
-	req, err := newRequest(cfg, http.MethodPost, "/rename", "", bytes.NewBuffer(jsonBody))
-	if err != nil {
-		return "", err
+	req.Header.Set("X-Sync-Key", cfg.Key)
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
 	}
-	req.Header.Set("Content-Type", "application/json")
+	return client.Do(req)
+}
 
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", err
+func describe(status int) error {
+	switch status {
+	case http.StatusNotFound:
+		return fmt.Errorf("status 404, check the server URL and that the reverse proxy strips its path prefix")
+	case http.StatusRequestEntityTooLarge:
+		return fmt.Errorf("status 413, raise the request body limit of the reverse proxy")
+	case http.StatusMethodNotAllowed:
+		return fmt.Errorf("status 405, the reverse proxy may have turned the request into a GET while redirecting")
+	default:
+		return fmt.Errorf("status %d", status)
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("status %d: %s", resp.StatusCode, string(body))
-	}
-
-	var syncResp protocol.SyncResponse
-	if err := json.NewDecoder(resp.Body).Decode(&syncResp); err != nil {
-		return "", err
-	}
-	return syncResp.Synced, nil
 }

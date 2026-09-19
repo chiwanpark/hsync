@@ -1,144 +1,99 @@
 # hsync
 
-hsync is a lightweight synchronization tool designed for [Heynote](https://heynote.com), enabling seamless synchronization of text notes across multiple devices.
-It consists of a central server and client software that communicate via HTTP to keep a directory of text files in sync.
+hsync keeps a directory of text notes in sync across devices, built for [Heynote](https://heynote.com).
+A server holds the notes and their history, and a client on every device pushes local changes and checks out the result.
 
 ## Features
 
-- **Directory Synchronization:** Syncs multiple `.txt` files within a specified directory, including nested directories.
-- **3-Way Merge:** Uses the `diffmatchpatch` algorithm to intelligently merge concurrent edits from multiple clients, minimizing conflicts.
-- **HTTP Transport:** communicating over standard HTTP.
-- **Shared Key Authentication:** simple security model using a shared secret key between server and clients.
-- **Automatic Sync:** Clients automatically detect local changes and push them to the server.
-- **Single Binary:** Both server and client functionalities are bundled into a single `hsync` executable.
+- Syncs `.txt` files in a directory, including nested directories.
+- Keeps a commit history, so a client that was offline for a long time merges against the state it knows instead of overwriting newer work.
+- Merges concurrent edits with `diffmatchpatch`, and propagates moves and deletions instead of resurrecting notes.
+- Runs as a single binary with shared key authentication over HTTP.
 
-## Installation
+## Build
 
-### Prerequisites
-
-- [Go](https://go.dev/) 1.27.1 or higher.
-
-### Build
-
-Clone the repository and build the `hsync` binary:
+Requires [Go](https://go.dev/) 1.27.1 or higher.
 
 ```bash
-git clone <repository-url>
-cd hsync
-go mod tidy
+make build          # or: go build -o bin/hsync ./cmd/hsync
 ```
 
-You can build using `make`:
+## Server
 
-```bash
-make build
-```
-
-Or manually:
-
-```bash
-go build -o bin/hsync ./cmd/hsync
-```
-
-The binary will be located in the `bin/` directory.
-
-## Usage
-
-The `hsync` binary uses subcommands to run as either a server or a client.
-
-### Server
-
-The server manages the central copy of the notes and handles merge operations.
-
-```bash
-./bin/hsync server [flags]
-```
-
-**Flags:**
-- `-addr`: Address to listen on (default `":8080"`).
-- `-dir`: Path to the directory storing the server-side text files (default `"data"`).
-- `-key`: Shared secret key for authentication (default `"default-secret"`).
-
-**Example:**
 ```bash
 ./bin/hsync server -addr :8080 -dir ./server_notes -key mySecretKey
 ```
 
-### Client
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `-addr` | `:8080` | Address to listen on |
+| `-dir` | `data` | Directory holding the notes and their history |
+| `-key` | `default-secret` | Shared secret the clients must send |
 
-The client runs on your local machine, monitoring a directory and syncing changes to the server. Configuration is managed via a TOML file.
+The notes stay plain `.txt` files in `-dir`; the history lives next to them in `.hsync/`.
+Notes you add, edit or delete in that directory by hand are committed on the next request.
 
-```bash
-./bin/hsync client [flags]
-```
-
-**Flags:**
-- `-config`: Path to the configuration file (default: `${HOME}/.config/hsync.toml`).
-
-**Configuration File (`hsync.toml`):**
-
-The client uses a TOML file for configuration. Below is an example:
-
-```toml
-server = "http://localhost:8080"      # URL of the hsync server
-key = "mySecretKey"                   # Shared secret key matching the server
-dir = "./my_notes"                    # Path to the local directory to synchronize
-interval = "2s"                       # Duration to wait between checks (e.g., "5s", "1m")
-state = "./hsync-state.json"          # Optional path to the sync state file
-timeout = "60s"                       # Optional HTTP timeout per request (default "60s")
-```
-
-The client stores the last synchronized content of every note in a state file.
-It is required to tell a locally deleted or moved note apart from a note that was never synchronized, so the move is not undone on the next start.
-When `state` is omitted, the file is created under `${XDG_STATE_HOME:-~/.local/state}/hsync/` with a name derived from the synchronized directory.
-
-**Example:**
-
-Run with default config path (`~/.config/hsync.toml`):
-```bash
-./bin/hsync client
-```
-
-Run with a specific config file:
-```bash
-./bin/hsync client -config my_config.toml
-```
-
-## Docker
-
-You can also run the server using Docker:
+Docker works as well:
 
 ```bash
 docker build -t hsync .
 docker run -p 8080:8080 -v $(pwd)/data:/app/data hsync
 ```
 
-## How it Works
-
-1. **Initialization:** When the client starts, it loads its state file. On the very first run it downloads the current state of all text files from the server, including files in nested directories. Local notes that the server does not have are uploaded instead of removed.
-2. **Monitoring:** The client checks the local files periodically (defined by `interval`).
-3. **Syncing:**
-   - If a local file is modified, the client sends a patch request to the server.
-   - The server performs a 3-way merge (Base vs. Latest vs. Server-Current) and saves the result.
-   - The server responds with the merged content.
-   - The client updates its local file with the merged result to stay in sync.
-
-**Limitations:**
-
-- Run at most one client per synchronized directory; two clients sharing a directory also share the state file and will fight over it.
-- Tombstones are kept for 90 days. A client that is offline longer re-uploads notes that were deleted meanwhile.
-- Notes are synchronized byte for byte, so devices that save with different line endings keep rewriting each other's notes.
-
-## Development & Testing
-
-Run the unit tests and the end-to-end script (one server, two clients) with:
+## Client
 
 ```bash
-make test
+./bin/hsync client -config my_config.toml
 ```
 
-You can also run the end-to-end script directly:
+Without `-config` the client reads `~/.config/hsync.toml`:
+
+```toml
+server = "http://localhost:8080"   # URL of the hsync server, may include a subpath
+key = "mySecretKey"                # Shared secret matching the server
+dir = "./my_notes"                 # Directory to synchronize
+interval = "2s"                    # Time between sync cycles (default "5s")
+timeout = "60s"                    # HTTP timeout per request (default "60s")
+state = "./hsync-state.json"       # Sync state file (default under $XDG_STATE_HOME/hsync)
+```
+
+The state file records the commit the device last synchronized with and the hash of every note.
+That commit is the parent of the next push and tells a note deleted or moved locally apart from one that was never synchronized.
+
+## Behind a Reverse Proxy
+
+The server always serves `/index`, `/push` and `/blob` at the root, so the proxy has to strip its own path prefix.
+Point the client at the full URL including that prefix, for example `server = "https://example.com/heynote"`.
+
+```nginx
+location ^~ /heynote/ {
+    proxy_pass http://127.0.0.1:8080/;
+    client_max_body_size 512m;
+}
+```
+
+A `rewrite` works as well, and is the form to use when other directives in the block prevent a trailing slash on `proxy_pass`:
+
+```nginx
+location ^~ /heynote/ {
+    rewrite /heynote/(.*) /$1 break;
+    proxy_pass http://127.0.0.1:8080;
+    client_max_body_size 512m;
+}
+```
+
+Raise the body limit, since a push carries the notes that changed.
+
+## Limitations
+
+- Run at most one client per synchronized directory; two clients sharing a directory also share the state file.
+- The history is never pruned, so the data directory keeps a blob for every version of every note.
+- Deleting the server history makes clients push against a fresh root commit, which merges notes that differ instead of tracking a common ancestor.
+- Notes are synchronized byte for byte, so devices saving with different line endings keep rewriting each other's notes.
+
+## Development
 
 ```bash
-./scripts/test.sh
+make test           # unit tests and the end-to-end script
+./scripts/test.sh   # end-to-end only: one server, two clients
 ```

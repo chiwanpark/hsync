@@ -1,22 +1,18 @@
 package protocol
 
-type SyncRequest struct {
-	Filename string `json:"filename"`
-	Base     string `json:"base"`
-	Latest   string `json:"latest"`
+type IndexResponse struct {
+	Commit string            `json:"commit"`
+	Root   string            `json:"root"`
+	Files  map[string]string `json:"files"`
 }
 
-type SyncResponse struct {
-	Synced string `json:"synced"`
+type PushRequest struct {
+	Parent string            `json:"parent"`
+	Files  map[string]string `json:"files"`
+	Blobs  map[string]string `json:"blobs"`
 }
 
-type RenameRequest struct {
-	From string `json:"from"`
-	To   string `json:"to"`
-	Base string `json:"base"`
-}
-
-type Tombstone struct {
-	DeletedAt int64  `json:"deletedAt"`
-	RenamedTo string `json:"renamedTo,omitempty"`
+type PushResponse struct {
+	Commit string            `json:"commit"`
+	Files  map[string]string `json:"files"`
 }
