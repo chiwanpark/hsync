@@ -1,6 +1,8 @@
 package repo
 
 import (
+	"strings"
+
 	"github.com/sergi/go-diff/diffmatchpatch"
 )
 
@@ -88,10 +90,6 @@ func resolve(base, ours, theirs string, blobs blobStore) (string, error) {
 		return ours, nil
 	}
 
-	baseContent, err := blobs.load(base)
-	if err != nil {
-		return "", err
-	}
 	ourContent, err := blobs.load(ours)
 	if err != nil {
 		return "", err
@@ -101,9 +99,36 @@ func resolve(base, ours, theirs string, blobs blobStore) (string, error) {
 		return "", err
 	}
 
+	if base == "" {
+		if normalizeText(ourContent) == normalizeText(theirContent) {
+			return ours, nil
+		}
+		return blobs.store(mergeWithoutAncestor(ourContent, theirContent))
+	}
+
+	baseContent, err := blobs.load(base)
+	if err != nil {
+		return "", err
+	}
+
 	dmp := diffmatchpatch.New()
 	merged, _ := dmp.PatchApply(dmp.PatchMake(baseContent, theirContent), ourContent)
 	return blobs.store(merged)
+}
+
+func mergeWithoutAncestor(ours, theirs string) string {
+	dmp := diffmatchpatch.New()
+	ourLines, theirLines, lines := dmp.DiffLinesToChars(ours, theirs)
+
+	var merged strings.Builder
+	for _, diff := range dmp.DiffCharsToLines(dmp.DiffMain(ourLines, theirLines, false), lines) {
+		merged.WriteString(diff.Text)
+	}
+	return merged.String()
+}
+
+func normalizeText(content string) string {
+	return strings.TrimRight(strings.ReplaceAll(content, "\r\n", "\n"), "\n")
 }
 
 func detectMoves(base, next map[string]string) map[string]string {

@@ -597,3 +597,55 @@ func noteNames(t *testing.T, root string) []string {
 	sort.Strings(names)
 	return names
 }
+
+func TestNewClientDoesNotDuplicateExistingNote(t *testing.T) {
+	note := "\u221e\u221e\u221etext-a\nMy scratch pad\nSecond line\n"
+
+	cases := map[string]string{
+		"identical":              note,
+		"extra trailing newline": note + "\n",
+		"windows line endings":   strings.ReplaceAll(note, "\n", "\r\n"),
+	}
+
+	for name, local := range cases {
+		t.Run(name, func(t *testing.T) {
+			ts, dataDir := newTestServer(t, map[string]string{"buffer.txt": note})
+
+			fresh := newTestClient(t, ts)
+			fresh.write(t, "buffer.txt", local)
+			fresh.sync()
+			fresh.sync()
+
+			assertContent(t, dataDir, "buffer.txt", note)
+			assertContent(t, fresh.cfg.DirPath, "buffer.txt", note)
+			assert.Len(t, noteNames(t, dataDir), 1, "the server should still hold a single note")
+		})
+	}
+}
+
+func TestClientFromAnOlderVersionMergesWithoutDuplicating(t *testing.T) {
+	note := "\u221e\u221e\u221etext-a\nShopping list\n- milk\n- bread\n"
+	stale := note + "- coffee\n"
+
+	ts, dataDir := newTestServer(t, map[string]string{"buffer.txt": note})
+
+	a := newTestClient(t, ts)
+	a.sync()
+	require.NotEmpty(t, a.state.Commit)
+
+	b := newTestClient(t, ts)
+	b.write(t, "buffer.txt", stale)
+	b.sync()
+
+	assertContent(t, dataDir, "buffer.txt", stale)
+	assert.Len(t, noteNames(t, dataDir), 1, "the server must still hold a single note")
+
+	a.sync()
+	b.sync()
+	assertContent(t, a.cfg.DirPath, "buffer.txt", stale)
+	assertConverged(t, dataDir, []*testClient{a, b})
+
+	for _, line := range []string{"Shopping list", "- milk", "- bread", "- coffee"} {
+		assert.Equal(t, 1, strings.Count(readNote(t, dataDir, "buffer.txt"), line), line)
+	}
+}

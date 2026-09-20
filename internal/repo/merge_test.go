@@ -2,6 +2,7 @@ package repo
 
 import (
 	"hsync/internal/utils"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -157,4 +158,48 @@ func TestDetectMoves(t *testing.T) {
 	next := index("moved/a.txt", "A", "b.txt", "B")
 
 	assert.Equal(t, map[string]string{"a.txt": "moved/a.txt"}, detectMoves(base, next))
+}
+
+func TestMergeWithoutCommonAncestor(t *testing.T) {
+	note := "Shopping list\n- milk\n- bread\n"
+
+	cases := []struct {
+		name   string
+		theirs string
+		want   string
+	}{
+		{name: "identical content", theirs: note, want: note},
+		{name: "extra trailing newline", theirs: note + "\n", want: note},
+		{name: "windows line endings", theirs: strings.ReplaceAll(note, "\n", "\r\n"), want: note},
+		{name: "line added by the other side", theirs: note + "- coffee\n", want: note + "- coffee\n"},
+		{name: "line inserted by the other side", theirs: "Shopping list\n- milk\n- eggs\n- bread\n", want: "Shopping list\n- milk\n- eggs\n- bread\n"},
+		{name: "line missing on the other side", theirs: "Shopping list\n- milk\n", want: note},
+		{name: "both sides have their own line", theirs: "Shopping list\n- milk\n- tea\n", want: note + "- tea\n"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			blobs := newMemoryBlobs(note, tc.theirs, tc.want)
+
+			got, err := mergeIndex(map[string]string{}, index("note.txt", note), index("note.txt", tc.theirs), blobs)
+			require.NoError(t, err)
+
+			require.Len(t, got, 1, "a note without an ancestor must not be copied")
+			assert.Equal(t, tc.want, blobs.contents[got["note.txt"]])
+		})
+	}
+}
+
+func TestMergeWithoutCommonAncestorKeepsEachLineOnce(t *testing.T) {
+	note := "Line one\nLine two\nLine three\n"
+	theirs := "Line one\nLine two\nLine three\nLine four\n"
+	blobs := newMemoryBlobs(note, theirs)
+
+	got, err := mergeIndex(map[string]string{}, index("note.txt", note), index("note.txt", theirs), blobs)
+	require.NoError(t, err)
+
+	merged := blobs.contents[got["note.txt"]]
+	for _, line := range []string{"Line one", "Line two", "Line three", "Line four"} {
+		assert.Equal(t, 1, strings.Count(merged, line), "%s appears more than once in %q", line, merged)
+	}
 }

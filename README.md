@@ -88,8 +88,8 @@ Raise the body limit, since a push carries the notes that changed.
 
 - Run at most one client per synchronized directory; two clients sharing a directory also share the state file.
 - The history is never pruned, so the data directory keeps a blob for every version of every note.
-- Deleting the server history makes clients push against a fresh root commit, which merges notes that differ instead of tracking a common ancestor.
-- Notes are synchronized byte for byte, so devices saving with different line endings keep rewriting each other's notes.
+- A note that exists on both sides without a shared commit, for example on a device that synchronized with an older version, is merged line by line instead of patched, so nothing is duplicated but a line deleted on one side comes back.
+- Notes are synchronized byte for byte, so devices saving with different line endings keep rewriting each other's notes once both sides share a history.
 
 ## Development
 
